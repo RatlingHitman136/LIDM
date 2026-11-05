@@ -1,4 +1,4 @@
-# cls — late-interaction typed-decision model
+# LIDM — late-interaction typed-decision model
 
 A small encoder-based zero-shot decision model in the style of TypeSafe's **Jev** and Convai's **Laya**:
 given a state (text/JSON), a question, and N candidate options with natural-language descriptions, return
