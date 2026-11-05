@@ -1,0 +1,9 @@
+mlruns/
+.venv/
+__pycache__/
+*.pyc
+artifacts/
+.pytest_cache/
+.ruff_cache/
+data/
+checkpoints/
