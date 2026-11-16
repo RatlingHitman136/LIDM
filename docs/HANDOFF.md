@@ -35,7 +35,7 @@ B. Looped head: 3 shared layers x2 (block 1,2,3,1,2,3 vs layer-wise 1,1,2,2,3,3)
 Shapes: text B x L x d; options N x L_opt x d; head: options as queries, text as K/V, self-attn among options,
 looped; scorer N x d -> N logits -> softmax.
 
-## 7. Head sketch (UNTESTED)
+## 5. Head sketch (UNTESTED; superseded by docs/ARCHITECTURE.md)
 ```python
 import torch, torch.nn as nn
 
@@ -62,11 +62,11 @@ class LoopedCrossHead(nn.Module):
         return logits.masked_fill(opt_pad_mask, float("-inf"))
 ```
 
-## 8. Open questions
+## 6. Open questions
 Laya's template/head wiring unpublished (read github.com/NandhaKishorM/laya); act/escalate output format
 undocumented; all numbers marked "my analysis" are estimates.
 
-## 9. Sources
+## 7. Sources
 typesafe.ai; huggingface.co/Emerald7664/laya, aaroncool9/laya, SandLogicTechnologies/laya-GGUF;
 huggingface.co/blog/sora-2/laya-ai-model-how-it-works-run-it-locally-and-eval;
 datacamp.com/blog/top-open-source-jev-alternatives; github.com/feder-cr/jev/wiki/open-source-alternative-to-jev;

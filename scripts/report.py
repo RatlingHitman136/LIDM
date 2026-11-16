@@ -1,13 +1,15 @@
-"""Regenerate docs/baseline_table.md from MLflow (experiment 'baselines', runs named m0-*)."""
+"""Regenerate docs/baseline_table.md from MLflow (experiment 'baselines', runs named m0-* and lidm-*)."""
 import mlflow
 
 from cls.tracking import DEFAULT_URI, ROOT
 
 mlflow.set_tracking_uri(DEFAULT_URI)
 df = mlflow.search_runs(experiment_names=["baselines"], filter_string="attributes.status = 'FINISHED'")
-df = df[df["tags.mlflow.runName"].str.startswith("m0-") & ~df["tags.mlflow.runName"].str.endswith("-quick")]
+df = df[df["tags.mlflow.runName"].str.startswith(("m0-", "lidm-")) & ~df["tags.mlflow.runName"].str.endswith("-quick")]
 df = df.sort_values("start_time").drop_duplicates("tags.mlflow.runName", keep="last")
-order = ["B0", "B3", "B1b", "B2", "B4", "B5", "B5b", "B6"]
+if not df["tags.mlflow.runName"].str.startswith("m0-").any():  # would overwrite the M0 table with LIDM rows only
+    raise SystemExit("no m0-* runs in this MLflow store; not touching docs/baseline_table.md")
+order = ["B0", "B3", "B1b", "B2", "B4", "B5", "B5b", "B6", "L1"]
 df["_o"] = df["tags.baseline_id"].map(lambda x: order.index(x) if x in order else 99)
 df = df.sort_values("_o")
 

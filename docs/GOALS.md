@@ -16,13 +16,13 @@ Laya (421M, ModernBERT-large) packs state + question + *all* options into one 51
 ## Primary goal
 Fix the **high-cardinality / long-option-description** weakness without a meaningful latency regression.
 
-## Success criteria (to be confirmed by measurement)
-1. Banking77 (77 options): clearly beat Laya's 0.425, aiming for the Jev ~0.87 range.
-2. No regression vs. Laya (within noise) on <=20-option, nuance-heavy tasks (BoolQ, XNLI-style).
-3. Latency: 1 question with a fresh label set within ~2x of Laya (~33-40 ms on T4 per its card);
-   with cached option vectors, equal or faster.
-4. Calibration: ECE after per-(question type, option count) temperature fitting comparable to Laya's (~0.08).
-5. Fits training on a 12 GB GPU (LoRA or checkpointed full fine-tune).
+## Success criteria (set from M0 measurements, docs/RESULTS.md; RTX 4070 SUPER)
+1. Banking77 N=77, zero-shot after training on the M0 mixture: >= 0.70 (beats bi-encoder B5b 0.695,
+   fine-tuned Laya B4 0.502); N=20 >= 0.85. Jev's 0.87 stays the stretch goal.
+2. No regression vs. fine-tuned Laya on nuance tasks: BoolQ >= 0.826, SST-5 >= 0.570 (B4).
+3. Latency, 1 question: p50 <= 35 ms with a fresh label set (~2x B0's 17.6 ms); <= 20 ms with cached options.
+4. Calibration: ECE <= 0.1 on every task after per-(question type, option count) temperature fitting.
+5. Fits training on a 12 GB GPU (frozen encoder, then LoRA).
 
 ## Non-goals (for now)
 - Text generation, multi-turn agents, act/escalate head.

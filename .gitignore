@@ -1,9 +1,10 @@
-mlruns/
+/mlruns/
 .venv/
 __pycache__/
 *.pyc
-artifacts/
+/artifacts/
 .pytest_cache/
 .ruff_cache/
-data/
-checkpoints/
+/data/
+/checkpoints/
+/logs/
