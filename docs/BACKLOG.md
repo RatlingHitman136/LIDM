@@ -20,7 +20,7 @@ fixes. Ordered by priority within each section. When an item is tried, move the 
 3. **Nuance (BoolQ, SST-5).** Frozen heads were at the majority class in M1. Measure the LoRA checkpoint with
    `scripts/eval_lidm.py`, then decide on stage 2 vs the joint-encoder control F.
 
-### Marker token vs pooled option (open, not tried)
+### Marker token vs pooled option (built: `--option-vector pooled`; not yet compared on the same encoder)
 Pass B scores each option at a `[MASK]` placed before its text. ModernBERT was pretrained to make a `[MASK]`
 output predict the missing word, so a frozen marker is the model's guess of a word preceding "card arrival",
 not a summary of the label. LoRA can retrain this, but a mean-pooled option vector (already computed for the
@@ -71,7 +71,9 @@ How to test: A/B in a stage-1 pilot (~500 steps, ~6 min each), same LR, compare 
   order is already in the label text and the RPS loss; an index embedding there would mostly allow a
   "pick the middle" shortcut. Revisit only if stage-2 `score` accuracy is weak.
 - **Looping**: retest C (sampled 1-8 and fixed 4) vs D on stage-2 rule/policy data, initialised from the
-  stage-1 B checkpoint. No gain on the M0 mixture.
+  stage-1 B checkpoint. No gain on the M0 mixture (M1) nor in stage 1 with encoder LoRA (3,000 steps from L1:
+  Banking77 0.437 / 0.439 / 0.437 at 1 / 2 / 4 loops vs 0.434). Label matching does not use extra depth; the
+  design doc expects gains only on multi-step rule questions.
 - **Early exit** for looped heads (stop when successive option distributions agree): not built.
 
 ## Training infrastructure

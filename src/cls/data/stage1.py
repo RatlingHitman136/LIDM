@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import random
 import zipfile
+from collections.abc import Callable
 
 from cls.data.typed import (
     CLINC_HELD_OUT,
@@ -197,3 +198,137 @@ def leak_report(train: list[dict], b77_labels: list[str]) -> dict:
     texts = {x.strip().lower() for split in ("train", "test") for x in load_banking77(split).texts}
     return {"shared_option_strings": sorted(opts & b77),
             "banking77_texts_in_train": sum(it["state"].strip().lower() in texts for it in train)}
+
+
+# ---------------------------------------------------------------- stage 1b: label variety
+# Stage 1 had 2,118 distinct option strings, each seen thousands of times, and every head learned per-label
+# corrections instead of reading labels (RESULTS.md, LIDM on gte). The synthetic set's refinedweb configs give
+# ~1M distinct label strings, most used once, with written-wrong labels per text as hard distractors.
+REFINEDWEB = {  # config -> (option column, instructions)
+    "mixtral_refinedweb_categories": ("category", ["What is this text about?", "Which topic does this text cover?",
+                                                   "Which category fits this text best?"]),
+    "mixtral_refinedweb_characteristics": ("hypothesis", ["Which statement is true about this text?",
+                                                          "Which description fits this text?",
+                                                          "What does this text do?"]),
+    "mixtral_refinedweb_nli": ("hypothesis", ["Which statement is true about this text?",
+                                              "Which description fits this text?"]),
+}
+STAGE1B_BASE = {"synthetic": 80_000, "utcd": 80_000, "label_nli": 50_000, "nli": 50_000}  # subsampled from stage 1
+
+
+def make_ban(labels) -> Callable[[str], bool]:
+    """Ban test for option strings: equal to a protected label (case-insensitive), or containing every word of a
+    multi-word one ("request for refund" vs Banking77's "request refund"). Indexed by each label's rarest-looking
+    (longest) word so ~1M options check quickly."""
+    import re
+
+    def words(t: str) -> set[str]:
+        return set(re.findall(r"[a-z0-9]+", t.lower()))
+
+    exact = {t.lower() for t in labels}
+    index: dict[str, list[set[str]]] = {}
+    for t in labels:
+        w = words(t)
+        if len(w) >= 2:
+            index.setdefault(max(w, key=len), []).append(w)
+
+    def banned(option: str) -> bool:
+        if option.lower() in exact:
+            return True
+        w = words(option)
+        return any(lw <= w for word in w for lw in index.get(word, ()))
+    return banned
+
+
+def refinedweb_items(df, task: str, instructions: list[str], rng: random.Random, banned=lambda o: False) -> list[dict]:
+    """df: columns text, option, labels (0 = true for this text). One choice question per text with a true
+    option: a random true option as the answer, all of the text's own written-wrong options as distractors,
+    then options of other texts in df to reach 2-24. The text's other true options never appear; options for
+    which banned(option) is true never appear at all."""
+    pool = df["option"].unique().tolist()
+    out = []
+    for text, g in df.groupby("text", sort=False):
+        own = {o.lower() for o in g["option"]}
+        true = [o for o in g["option"][g["labels"] == 0] if not banned(o)]
+        false = list(dict.fromkeys(o for o in g["option"][g["labels"] == 1] if not banned(o)))
+        if not true:
+            continue
+        k = min(max(rng.randint(2, MAX_OPTS), len(false) + 1), MAX_OPTS)
+        negs = rng.sample(false, min(len(false), k - 1))
+        seen = own | {o.lower() for o in negs}
+        tries = 0
+        while len(negs) < k - 1 and tries < 50 * k:  # bounded: a small pool may run out of fresh options
+            tries += 1
+            o = rng.choice(pool)
+            if o.lower() not in seen and not banned(o):
+                negs.append(o)
+                seen.add(o.lower())
+        if not negs:
+            continue
+        gold = rng.choice(true)
+        opts = negs + [gold]
+        rng.shuffle(opts)
+        out.append(_choice(task, text.strip(), rng.choice(instructions), opts, opts.index(gold)))
+    return out
+
+
+def cross_task_distractors(items: list[dict], rng: random.Random, p: float = 0.3) -> None:
+    """In place: for a share p of the questions, replace half the distractors with labels of other tasks, so
+    knowing which taxonomy a question comes from stops predicting the answer."""
+    by_task: dict[str, set[str]] = {}
+    for it in items:
+        by_task.setdefault(it["task"], set()).update(it["criteria"])
+    pool = sorted({t for s in by_task.values() for t in s})
+    foreign_of = {t: [o for o in pool if o not in own] for t, own in by_task.items()}  # may be empty (one task)
+    for it in items:
+        opts = it["criteria"]
+        if rng.random() >= p or len(opts) < 3:
+            continue
+        foreign = foreign_of[it["task"]]
+        for i in rng.sample([j for j in range(len(opts)) if j != it["gold"]], (len(opts) - 1) // 2):
+            for _ in range(100):  # bounded: never spin when no fresh foreign label is left
+                o = rng.choice(foreign) if foreign else None
+                if o is not None and o not in opts:
+                    opts[i] = o
+                    break
+
+
+def build_stage1b(base: list[dict], val: list[dict], seed: int = 0, heldout_texts: int = 1000):
+    """Stage-1b mixture: refinedweb label-variety questions + subsamples of the stage-1 data. Labels of the zs/ val
+    sets and Banking77 (and near-duplicates, see make_ban) are banned, so the zs/ sets stay label-disjoint.
+    Also returns held-out refinedweb questions (`heldout/<config>`): texts kept out of training, distractors
+    drawn only among held-out texts, and options that also occur in training removed, so their answers are
+    unseen labels from the training domain. Returns (train, heldout)."""
+    from cls.data.banking77 import load_banking77
+
+    rng = random.Random(seed)
+    protected = {t for v in val if v["task"].startswith("zs/") for t in v["criteria"]}
+    protected |= set(load_banking77("test").descriptions)
+    banned = make_ban(protected)
+    items, heldout = [], []
+    for cfg, (col, instr) in REFINEDWEB.items():
+        ds = _load("MoritzLaurer/synthetic_zeroshot_mixtral_v0.1", cfg, "train")
+        df = ds.select_columns(["text", col, "labels"]).to_pandas().rename(columns={col: "option"})
+        texts = df["text"].unique().tolist()
+        keep_out = set(rng.sample(texts, min(heldout_texts, len(texts))))
+        name = cfg.split("_")[-1]
+        items += refinedweb_items(df[~df["text"].isin(keep_out)], f"refinedweb/{name}", instr, rng, banned)
+        heldout += refinedweb_items(df[df["text"].isin(keep_out)], f"heldout/{name}", instr, rng, banned)
+    groups: dict[str, list[dict]] = {}
+    for it in base:
+        groups.setdefault(it["task"].split("/")[0], []).append(it)
+    picked = {g: rng.sample(groups[g], min(n, len(groups[g]))) for g, n in STAGE1B_BASE.items()}
+    for g in ("synthetic", "utcd"):
+        picked[g] = [dict(it, criteria=list(it["criteria"])) for it in picked[g]]  # copies: edited below
+    cross_task_distractors(picked["synthetic"] + picked["utcd"], rng)  # one call: synthetic is a single task
+    items += [it for g in picked.values() for it in g]
+    items = [it for it in items if not any(banned(t) for t in it.get("criteria", []))]
+    rng.shuffle(items)
+    seen = {t.lower() for it in items for t in it.get("criteria", [])}
+    clean = []
+    for it in heldout:  # keep only unseen options; drop questions whose answer was seen or with < 2 options left
+        gold = it["criteria"][it["gold"]]
+        opts = [t for t in it["criteria"] if t.lower() not in seen]
+        if gold.lower() not in seen and len(opts) >= 2:
+            clean.append(dict(it, criteria=opts, gold=opts.index(gold)))
+    return items, clean

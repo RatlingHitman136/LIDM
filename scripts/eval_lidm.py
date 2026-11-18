@@ -10,8 +10,7 @@ import torch
 
 from cls.data.typed import _choice, _load, humanize
 from cls.eval import harness
-from cls.model import LIDM, Encoder
-from cls.train import encode
+from cls.train import encode, load_model
 
 ap = argparse.ArgumentParser()
 ap.add_argument("ckpt")
@@ -21,21 +20,8 @@ ap.add_argument("--quick", action="store_true", help="200 items per task")
 ap.add_argument("--no-track", action="store_true")
 a = ap.parse_args()
 
-st = torch.load(a.ckpt, map_location="cuda")
+enc, m, prior, st = load_model(a.ckpt)
 c = st["config"]
-enc = Encoder(lora_rank=c.get("encoder_lora") or 0)
-if c.get("encoder_lora"):
-    enc.load_lora(st["encoder_lora"])
-enc.train(False)
-m = LIDM(enc.d, enc.heads, enc.inter, enc.n_layers, c["n_blocks"], c["loops"], c["lora_rank"],
-         dual_score=not c["no_dual_score"]).cuda()
-m.load_state_dict(st["model"])
-m.eval()
-prior = None
-if c.get("prior") == "bge":
-    from cls.eval.run_m0 import BiEncoder
-
-    prior = BiEncoder("BAAI/bge-base-en-v1.5", "cls")
 
 
 @torch.no_grad()
@@ -59,7 +45,8 @@ tasks = harness.default_tasks(a.quick)
 tasks["ag_news_test"] = test_items("ag_news", "fancyzhx/ag_news", None, "What is the topic of this news article?", n)
 tasks["emotion_test"] = test_items("emotion", "dair-ai/emotion", "split", "Which emotion does the text express?", n)
 params = {"checkpoint": a.ckpt, "step": st["step"], "encoder_lora": c.get("encoder_lora") or 0,
-          "prior": c.get("prior", "encoder"), "run": c["run"], "loops": c["loops"]}
+          "prior": c.get("prior", "encoder"), "run": c["run"], "loops": c["loops"],
+          "encoder": c.get("encoder"), "option_vector": c.get("option_vector_resolved", "marker")}
 tags = {"model": "lidm", "milestone": "stage1", "stage": "eval", "baseline_id": a.id}
 n_params = sum(p.numel() for p in m.parameters()) + sum(p.numel() for p in enc.lora_params())
 harness.run_eval(f"lidm-{a.name}" + ("-quick" if a.quick else ""), predict, params, tags, tasks,

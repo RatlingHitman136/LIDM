@@ -45,6 +45,23 @@ head budget, which is what collapses accuracy above ~20 options (RESULTS.md, M0 
 8. **Loss**: cross-entropy (= KL to a one-hot target) + 0.5 x RPS for `score` (`decision_loss`).
    Temperature fitting (per question type and option-count bucket) not built yet.
 
+## Encoder choice, option vector and retrieval term (options in `cls.train`)
+- `--encoder <hf name>`: any ModernBERT-architecture checkpoint; the head takes width, heads, feed-forward size
+  and layer count from its config. Default ModernBERT-large; retrieval-trained `Alibaba-NLP/gte-modernbert-base`
+  (149M, d=768, 22 layers) is the next candidate (RESULTS.md, retrieval-trained encoders).
+- `--option-vector marker|pooled`: score each option at a `[MASK]` placed after `[CLS]` (default), or with the
+  encoder's own pooling (`cls` or `mean`, from its sentence-transformers config), encoding `[CLS] option [SEP]`
+  as retrieval models were trained. Tested against a padded-layout reference.
+- `--prior encoder|bge|self`: the retrieval term. `encoder` = cosine of mean-pooled mixed states (default);
+  `bge` = bge-base-en-v1.5; `self` = this encoder's own retrieval embedding (`Encoder.embed`) with LoRA switched
+  off, so training cannot wear the pretrained geometry down. With `bge` / `self` the term's scale starts at
+  1 / the fitted temperature and, from scratch, the scorer at zero, so training starts at retrieval accuracy.
+- `scripts/fit_prior_weight.py`: after training, refits only the retrieval weight s on the `zs/` val sets and
+  saves `fit.pt`. Training learns s on seen labels, where the head beats retrieval, and under-weights retrieval on
+  unseen ones (3b: trained s = 7.07, fitted s = 160).
+- `cls.train.load_model(path)`: rebuilds encoder (+LoRA), head and prior from a checkpoint's config; all eval
+  scripts use it.
+
 ## Deviations from DESIGN.md, and why
 | Change | Why (evidence) |
 |---|---|
@@ -74,7 +91,8 @@ src/cls/head.py         FusionBlock / FusionHead (looping, per-loop LoRA, trunca
 src/cls/train.py        training: M1 grid (--run B|C|D) and stage 1 (--stage1); MLflow + checkpoints
 src/cls/data/typed.py   item schema, M0 mixture, eval sets (Banking77, BoolQ, SST-5)
 src/cls/data/stage1.py  stage-1 label-reading mixture + zero-shot val (UTCD out-of-domain sets)
-scripts/prepare_data.py, scripts/prepare_stage1.py, scripts/eval_banking77.py
+scripts/prepare_data.py, scripts/prepare_stage1.py, scripts/eval_banking77.py, scripts/eval_lidm.py,
+                        scripts/bench_latency.py, scripts/fit_prior_weight.py
 tests/                  order invariance, padding, packed vs padded head, loops, layer tuples, loss, UTCD + zs tagging
 ```
 Not built yet: run A head, joint-encoder control (F), temperature fitting, early exit,

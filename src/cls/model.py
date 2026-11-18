@@ -47,6 +47,21 @@ class Encoder:
         cfg = self.model.config
         self.d, self.heads, self.inter, self.n_layers = (cfg.hidden_size, cfg.num_attention_heads,
                                                          cfg.intermediate_size, cfg.num_hidden_layers)
+        self.pooling = _pooling(name)
+        self.marker = True  # pass B prepends the [MASK] marker; False for option_vector 'cls' / 'mean'
+
+    @torch.no_grad()
+    def embed(self, texts: list[str], max_length: int = 512):
+        """The encoder's own retrieval embedding (`[CLS] text [SEP]`, its sentence-transformers pooling,
+        L2-normalised), with LoRA switched off so training cannot wear down the pretrained geometry."""
+        import contextlib
+
+        enc = self.tok(list(texts), padding=True, truncation=True, max_length=max_length,
+                       return_tensors="pt").to(self.device)
+        with self.model.disable_adapter() if self.lora_rank else contextlib.nullcontext():
+            h = self.model(**enc).last_hidden_state.float()
+        v = h[:, 0] if self.pooling == "cls" else _masked_mean(h, enc["attention_mask"].bool())
+        return F.normalize(v, dim=-1).cpu().numpy()
 
     def lora_params(self) -> list[torch.nn.Parameter]:
         return [p for p in self.model.parameters() if p.requires_grad]
@@ -74,14 +89,31 @@ class Encoder:
                        return_tensors="pt").to(self.device)
         return self._layers(enc), enc["attention_mask"].bool()
 
-    def encode_options(self, texts: list[str]):
+    def encode_options(self, texts: list[str], marker: bool = True):
         """Distinct option strings -> (L tensors U x To x d, U x To), padded to the longest, truncated at
         max_opt_len. Called per batch: caching every option of a large label set would not fit in VRAM
-        (all layers cost ~57 KB per token)."""
-        enc = self.tok([f"{self.tok.mask_token} {t}" for t in texts], padding=True, truncation=True,
-                       max_length=self.max_opt_len, return_tensors="pt").to(self.device)
-        assert (enc["input_ids"][:, MARKER_POS] == self.tok.mask_token_id).all()
+        (all layers cost ~57 KB per token). marker=False encodes `[CLS] option [SEP]` as retrieval models
+        were trained, for scoring from the encoder's own pooling instead of a [MASK] marker."""
+        texts = [f"{self.tok.mask_token} {t}" for t in texts] if marker else list(texts)
+        enc = self.tok(texts, padding=True, truncation=True, max_length=self.max_opt_len,
+                       return_tensors="pt").to(self.device)
+        if marker:
+            assert (enc["input_ids"][:, MARKER_POS] == self.tok.mask_token_id).all()
         return self._layers(enc), enc["attention_mask"].bool()
+
+
+def _pooling(name: str) -> str:
+    """'cls' or 'mean', from the model's sentence-transformers pooling config; 'mean' for plain MLM checkpoints."""
+    import json
+
+    from huggingface_hub import hf_hub_download
+    try:
+        path = hf_hub_download(name, "1_Pooling/config.json")
+    except Exception:  # noqa: BLE001 - any failure here means no pooling config: not a sentence-embedding model
+        return "mean"
+    with open(path) as f:
+        cfg = json.load(f)
+    return "cls" if cfg.get("pooling_mode_cls_token") else "mean"
 
 
 def _masked_mean(x, m):
@@ -91,8 +123,12 @@ def _masked_mean(x, m):
 
 class LIDM(nn.Module):
     def __init__(self, d=1024, heads=16, inter=2624, n_layers=28, n_blocks=2, loops=1, lora_rank=16,
-                 dual_score=True):
+                 dual_score=True, option_vector="marker"):
+        """option_vector: how an option's head output becomes its score: 'marker' = the [MASK] token after [CLS]
+        (needs Encoder.encode_options(marker=True)); 'cls' = its first token; 'mean' = mean of its tokens."""
         super().__init__()
+        assert option_vector in ("marker", "cls", "mean"), option_vector
+        self.option_vector = option_vector
         self.mix_a = nn.Parameter(torch.zeros(n_layers))  # softmax layer mix per pass (Peters et al.)
         self.mix_b = nn.Parameter(torch.zeros(n_layers))
         self.head = FusionHead(d, heads, inter, n_blocks, loops, lora_rank)
@@ -129,8 +165,15 @@ class LIDM(nn.Module):
         x_mask = torch.zeros(x0.shape[:2], dtype=torch.bool, device=x0.device)
         x_mask[rows, pos[rows, cols]] = True
         x = self.head(x0, x_mask, a, a_mask, loops)
-        marker = pos[:, MARKER_POS::to].clamp(min=0)  # Q x N packed index of each option's marker token
-        logits = self.scorer(x.gather(1, marker[..., None].expand(-1, -1, x.shape[-1]))).squeeze(-1).float()
+        if self.option_vector == "mean":  # mean of each option's own head outputs
+            seg = rows * n + cols // to  # (question, option) of each real token
+            vec = x.new_zeros(q * n, x.shape[-1]).index_add_(0, seg, x[rows, pos[rows, cols]])
+            vec = vec / torch.bincount(seg, minlength=q * n).clamp(min=1)[:, None].to(vec.dtype)
+            vec = vec.view(q, n, -1)
+        else:  # one token per option: the [MASK] marker (position 1) or [CLS] (position 0)
+            slot = pos[:, (MARKER_POS if self.option_vector == "marker" else 0)::to].clamp(min=0)  # Q x N packed index
+            vec = x.gather(1, slot[..., None].expand(-1, -1, x.shape[-1]))
+        logits = self.scorer(vec).squeeze(-1).float()
         if self.dual_scale is not None and prior is not None:
             logits = logits + self.dual_scale * prior
         elif self.dual_scale is not None:  # retrieval prior: cos(pooled pass A, pooled option)

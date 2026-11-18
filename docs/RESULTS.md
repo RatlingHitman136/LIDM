@@ -135,6 +135,24 @@ Banking77 test = all 3,080 items through `scripts/eval_banking77.py`; chance 0.0
 | LoRA pilot | LoRA r=16 | encoder cos | 500 | 35 min | 5.0 GB | 0.029 | 0.100 | 35da46c4 |
 | LoRA pilot, 1k | LoRA r=16 | encoder cos | 1,000 | 63 min | 5.4 GB | 0.072 | 0.156 | b23558f4 |
 | **LoRA, full** | **LoRA r=16** | **encoder cos** | **7,608** | **6.9 h** | **5.5 GB** | **0.434** | **0.641** | **bdf553e8** |
+| C (2 blocks looped, 1-4 sampled), `--init` from LoRA full | LoRA r=16 | encoder cos | +3,000 | 2.9 h | 6.6 GB | 0.437 / 0.439 / 0.437 at 1 / 2 / 4 loops | 0.645 / 0.644 / 0.641 | 5fcede8e |
+| LoRA + bge prior, `--init` from LoRA full | LoRA r=16 | bge-base cos | +3,000 | 2.9 h | 5.5 GB | 0.514 (bge alone 0.695) | 0.716 (0.830) | a91cf3f2 |
+
+Looping from L1 adds nothing: every depth matches L1 within noise (±0.01 on 3,080 items), and on validation
+1 loop scored at least as well as 2 or 4 at all six checkpoints. Training loss kept falling (0.38 -> 0.35)
+without a zero-shot gain. The matching B continuation (control) was not run; with no difference to explain, it
+is not needed for this conclusion.
+
+**LoRA + bge prior from L1** (`--prior bge --init`, +3,000 steps, 2.9 h, 5.5 GB, mlflow a91cf3f2): Banking77 test
+**0.514** @N=77, **0.716** @N=20: +8 points over L1, but far below bge alone (0.695 / 0.830; McNemar z = -18.9).
+The learned prior scale fell from 12.5 to 7.07 and the head's logits spread 3.5x wider than the prior's, so the
+head decides, and on unseen labels it is usually the one that is wrong (713 vs 155 disagreements in bge's
+favour). Refitting only the bge weight a (score = head + a * cos_bge) on the Banking77 train slice picks
+a = 160, i.e. almost pure bge, giving 0.689 / 0.829 on test. Across the whole range of a, test accuracy rises
+monotonically to bge alone and never meaningfully exceeds it (best 0.696 at a = 320). The head is right on 4.8%
+of questions where bge is wrong (oracle 0.743), but no fixed weight can use that. Conclusion: on unseen-label
+matching the trained head adds nothing to bge; the weight learned on training data (where the head knows the
+labels) is the wrong one for zero-shot.
 
 LR pilot training loss at steps 401-500 (the single-pass signal used to pick the LR): 5e-5 0.904, **1e-4 0.840**,
 2e-4 0.923, 3e-4 1.047 (stalled). `best.pt` of the full LoRA run (step 5,000) scores 0.436 / 0.649, the same
@@ -182,7 +200,7 @@ in stage 1 through UTCD (with different label wording), so these are in-distribu
 |---|---|---|---|
 | Banking77 N=77 / N=20 | >= 0.70 / >= 0.85 | 0.434 / 0.650 | not met |
 | BoolQ / SST-5 (no regression vs B4) | >= 0.826 / >= 0.570 | 0.670 / 0.374 | not met (zero-shot vs B4's in-distribution) |
-| Latency p50, fresh / cached options | <= 35 ms / <= 20 ms | 55.4 ms / not measured | not met fresh |
+| Latency p50, fresh / cached options | <= 35 ms / <= 20 ms | 35.9 ms / **12.6 ms** with LoRA merged (55.4 ms unmerged) | cached met; fresh at target (+0.9 ms) |
 | ECE after temperature fitting | <= 0.1 everywhere | raw already <= 0.10 except SST-5 0.13 | likely met; temperatures not fitted yet |
 | Trains on a 12 GB GPU | yes | 5.5 GB peak | met |
 
@@ -194,8 +212,17 @@ What the comparison shows:
   shipped Laya had 0.13-0.33.
 - **SST-5 zero-shot (0.374) beats shipped Laya (0.305)**; BoolQ (0.670) is above the majority class but below
   every Laya variant.
-- **Latency is ~3x Laya's** with a fresh label set: both passes run every call, LoRA is unmerged, the encoder
-  pads. Cached options and merged LoRA are the obvious first fixes; not measured yet.
+- **Latency** (`scripts/bench_latency.py`, batch 1, Banking77 N=77, p50 over 100 calls):
+
+  | Variant | p50 / p95 | pass A | pass B (77 options) | head |
+  |---|---|---|---|---|
+  | fresh options, LoRA unmerged (what `eval_lidm.py` logs) | 56.0 / 60.6 ms | 17.3 | 34.6 | 4.6 |
+  | fresh options, LoRA merged | 35.9 / 40.2 ms | 8.5 | 23.5 | 4.5 |
+  | **cached options, LoRA merged** | **12.6 / 14.7 ms** | 8.6 | 0 | 4.1 |
+
+  Merging LoRA into the bf16 weights changes ~4% of predictions but not accuracy (1,000 Banking77 items: 0.438
+  unmerged, 0.438 merged; merging in fp32 and storing fp16: 0.444, 97% agreement). With cached options LIDM is
+  faster than shipped Laya (17.6 ms); with a fresh label set, encoding the 77 options is two thirds of the time.
 
 ### Findings
 1. **The frozen encoder was the bottleneck.** Frozen, every head memorised the training labels: seen-label val
@@ -210,6 +237,109 @@ What the comparison shows:
    run had training loss still falling, so capacity was not the limit.
 5. patent stays near chance in every run (0.14 vs 0.11; abstract patent-class labels); multi_eurlex (61 items)
    is too small to read.
+
+### Retrieval-trained encoders as plain bi-encoders (2026-11-16)
+Cosine between the state and each label, argmax (no temperature), through `Encoder.embed` (the encoder's own
+sentence-transformers pooling). Banking77 test = all 3,080; `zs/` and `ood/` = stage-1 val sets.
+
+| Encoder | Licence | Arch / pooling | B77 N=77 | N=20 | zs/banking77 | zs/consumer_finance | zs/patent | zs/multi_eurlex | zs mean |
+|---|---|---|---|---|---|---|---|---|---|
+| bge-base-en-v1.5 (110M) | MIT | BERT / cls | **0.695** | **0.830** | 0.653 | 0.383 | 0.173 | 0.344 | 0.389 |
+| gte-modernbert-base (149M) | Apache-2.0 | ModernBERT / cls | 0.634 | 0.779 | 0.590 | 0.477 | 0.150 | 0.328 | 0.386 |
+| modernbert-embed-base (149M), no prefix | Apache-2.0 | ModernBERT / mean | 0.596 | 0.745 | 0.553 | 0.463 | 0.163 | 0.459 | 0.410 |
+| modernbert-embed-base, `classification:` prefix | Apache-2.0 | ModernBERT / mean | 0.643 | 0.783 | 0.617 | 0.473 | 0.170 | 0.443 | 0.426 |
+
+**LIDM on gte-modernbert-base** (full stage 1 from scratch: LoRA r=16, `--option-vector pooled` (cls),
+`--prior self`; 7,608 steps, 4.4 h, 3.1 GB; mlflow 1e50532e). Banking77 test **0.628 / 0.775** (N=77 / N=20) as
+trained, **0.635 / 0.778** with the retrieval weight refitted on zero-shot val (`fit.pt`, s = 160 vs trained
+26.6): equal to gte alone (0.634 / 0.779). Zero-shot val stayed at gte's level for the whole run while training
+loss fell 0.85 -> 0.47.
+
+Why the head adds nothing on unseen labels (`last.pt`):
+
+| | Banking77 test (unseen labels) | 1,500 training questions (seen labels) |
+|---|---|---|
+| head alone / retrieval alone | **0.015** (chance 0.013) / 0.634 | **0.689** / 0.655 |
+| combined, trained s | 0.628 | **0.863** |
+| head's mean top probability | 0.05 | 0.71 |
+| logit spread, head vs trained prior | 1.5 vs 6.3 | 2.4 vs 1.7 |
+| re-ranking retrieval's top 5: head / retrieval / random | 0.192 / 0.634 / ~0.17 | 0.681 / 0.655 |
+
+On seen labels the head and retrieval are strongly complementary (+21 points combined); on unseen labels the head
+is flat, unconfident and no better than random even for re-ranking retrieval's top 5. 49% of the head's score
+variance on Banking77 is a fixed offset per label, independent of the question (retrieval: 20%). The head learned
+label-specific corrections for the 2,118 training labels, not a way to read labels: with a strong retrieval term
+present from step 0, the generalisable part of the task is already explained, and the cheapest remaining loss
+reduction is per-label residuals. The L1 head (no strong prior) did learn some reading (0.42 alone), but its
+combination with bge also did not beat bge.
+
+bge through `Encoder.embed` reproduces M0's B5b exactly (0.695 / 0.830). Both ModernBERT retrievers are 5-6 points
+below bge on Banking77 but far above LIDM-on-ModernBERT-large (0.434). gte-modernbert-base is the first pick for
+LIDM: within noise of the prefixed nomic model, no prefixes, `[CLS]` pooling, and ModernBERT architecture, so the
+LoRA targets and head initialisation work unchanged.
+
+---
+
+## Stage 1b — label variety (2026-11-17/18)
+
+Data: `scripts/prepare_stage1b.py`: 522,691 questions with **961,447 distinct option strings** (stage 1: 2,118):
+refinedweb categories / characteristics / nli from the synthetic set (263k; each text's written-wrong labels as
+distractors), plus 80k synthetic, 80k UTCD (30% with distractors from other tasks), 50k yes/no, 50k NLI. Labels of
+the zs/ val sets and Banking77, and near-duplicates (all words of a multi-word label), are banned. New val sets
+`heldout/*` (1,936 questions): refinedweb texts kept out of training, answers never seen in training.
+Run with `scripts/run_stage1b_overnight.sh`; logs in `logs/overnight/`.
+
+| Run | Steps | Wall | B77 test N=77 trained / refit s | N=20 | head alone B77 | zs val (combined) | heldout val | mlflow |
+|---|---|---|---|---|---|---|---|---|
+| gte-modernbert-base, LoRA, pooled, self prior, prior dropout 0.5 | 4,084 | 5.2 h | 0.548 / 0.599 (s 8.3 -> 20) | 0.709 / 0.752 | **0.456** (was 0.015) | 0.368 | **0.905** | stage1b-gte-lora |
+| ModernBERT-large, LoRA, marker, encoder prior (L1 settings) | 2,500 of 4,084 (7 h limit at 9.5 s/step) | 7 h | 0.433 / 0.435 | 0.618 / 0.616 | 0.423 | 0.337 | 0.925 | stage1b-mbl-lora |
+| *gte alone (retrieval)* | – | – | *0.634* | *0.779* | – | *0.386* | *~0.71* | – |
+
+**What changed:** label variety removed the memorisation. The gte head alone now reads unseen labels (Banking77
+0.015 -> 0.456; per-label offset share 0.49 -> 0.22) and on unseen labels from the training domain beats retrieval by
+20 points (heldout 0.907 vs 0.708), still +11 when texts are cut to 10 words.
+
+**What did not:** transfer to intent-style targets. Per val set, head alone vs gte alone: patent 0.267 vs 0.150 (+12),
+multi_eurlex 0.328 vs 0.328 (combined 0.443, +11), but banking77 0.433 vs 0.590 (-16) and consumer_finance 0.277 vs
+0.477 (-20). The best weight on the Banking77 test itself (s = 80) gives 0.643, +0.9 over retrieval (noise).
+
+**Why the head trails retrieval on Banking77** (`last.pt`, 3,080 test questions):
+
+| Test | Head | Retrieval |
+|---|---|---|
+| message shares a content word with the gold label (2,226) | 0.514 | 0.722 |
+| no shared word, implicit (854) | 0.304 | 0.405 |
+| N=10, random distractors / 9 most similar labels | 0.759 / 0.569 | 0.850 / 0.669 |
+| seven instruction wordings incl. training ones and none | 0.456-0.485 | 0.634 |
+
+Not reasoning (the gap is largest on plain word matches, -21, smaller on implicit messages, -10), not hard
+distractors (both lose ~19 points from easy to hard), not the unseen instruction (+-3), not text length (the head
+keeps +11 to +20 on short in-domain texts). The head learned to match texts to the kind of labels it trained on
+(descriptive topic categories and statements about web documents) and transfers to similar label types (patent,
+EuroLex topics), but not to customer-intent labels ("card arrival", "pending top up") or complaint product types,
+where retrieval's pretraining on query-intent pairs is far broader than our data.
+
+### Banking77 with label descriptions (2026-11-18)
+
+Options replaced by one-sentence descriptions written from the label names only
+(`src/cls/data/banking77_descriptions.json`; reviewed by a separate agent: no leakage, longest shared n-grams with
+test messages are the label names themselves; 13 rewritten for separability; `get_physical_card` vs
+`order_physical_card` cannot be told apart from the names and was left as is). A separate benchmark condition, not
+comparable with names-only Banking77 numbers. `scripts/eval_banking77_descriptions.py`, all 3,080 test questions.
+
+| N=77 (N=20) | names only | descriptions only | `name: description` |
+|---|---|---|---|
+| bge alone | 0.696 (0.830) | 0.718 (0.845) | **0.732 (0.862)** |
+| gte alone | 0.634 (0.779) | 0.703 (0.840) | 0.696 (0.827) |
+| LIDM gte stage 1b: head alone | 0.456 (0.650) | 0.411 (0.629) | 0.463 (0.677) |
+| LIDM gte stage 1b: combined, refitted s = 20 | 0.599 (0.752) | 0.634 (0.794) | 0.646 (0.799) |
+| LIDM ModernBERT-large stage 1b: head alone | 0.423 (0.609) | 0.374 (0.589) | 0.505 (0.685) |
+| LIDM ModernBERT-large stage 1b: combined, refitted | 0.435 (0.616) | 0.482 (0.667) | 0.558 (0.732) |
+| LIDM ModernBERT-large L1: head alone | 0.420 (0.629) | 0.451 (0.662) | 0.395 (0.635) |
+
+Descriptions help retrieval (+2 to +7 points) more than any LIDM head (-5 to +8, inconsistent across formats).
+In no condition does LIDM beat the best plain bi-encoder; with descriptions the gap to its own retrieval term stays
+(gte stage 1b: 0.646 combined vs 0.696 retrieval). The head's Banking77 weakness is not the label format.
 
 ---
 
