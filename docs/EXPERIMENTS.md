@@ -77,6 +77,102 @@ underestimate LoRA runs. **Plan change:** the encoder is adapted with LoRA from 
 "frozen until stage 2b" does not hold for this task. Next levers for the stage-1 plateau (from ~3,500 steps):
 more label variety, LoRA + bge prior (both need `--init`, see BACKLOG.md).
 
+## Context suite: zero-shot, existing checkpoints (built 2026-11-18, not yet run)
+
+Does LIDM read the state where embeddings cannot? `src/cls/data/context_suite.py` + `scripts/eval_context_suite.py`,
+chained by `scripts/run_context_suite.sh` (~1 h; results in `logs/context_suite/summary.log`, MLflow `context_suite`).
+
+| Group | Tasks (≤1,000 questions each) | Regime |
+|---|---|---|
+| 1 System One | typed-decisions test (400 cases, ~2,000 questions) | mixed |
+| 2 content in options | RACE, QuAIL, When2Call MCQ | 2 |
+| 3 negation / contrast | CondaQA, VitaminC | 1 |
+| 4 content in question | BoolQ, PubMedQA, SQuAD 2.0 answerability, ANLI, WANLI | 1 |
+
+Models: LIDM stage-1b gte and stage-1 ModernBERT-large LoRA, bge and gte alone (floor), shipped Laya,
+laya-typed-decisions (in-domain for group 1), optional Laya B4 (`WITH_B4=1`, retrained). Ablation `--options-in-question`
+writes every option into pass A's question: a large gain on regime 2 means the head does not recover the interaction
+the late split removes. Read: regime 1 should be near Laya; regime 2 is the design's risk. Evaluation only: RACE,
+QuAIL and ANLI are non-commercial.
+
+## Kill-criterion test: typed decisions, same backbone and data (built 2026-11-18)
+
+GOALS.md kill criterion, condition 1 ("Laya wins on nuance tasks"); condition 2 (<20 options) already holds for
+typed decisions (2-4 options). Both sides ModernBERT-large, fine-tuned on LocalLLaMA/typed-decisions train
+(Apache-2.0), hard labels, split by case: 1,080 train / 120 dev cases (selection) / official 400-case test
+(`scripts/prepare_typed_decisions.py` -> `data/td/`).
+- LIDM: `scripts/run_td_lidm.sh` (stage-1 MBL LoRA init, lr 5e-5 / 1e-4 / 3e-4, 6 passes, dev-selected, then test
+  and context suite).
+- LIDM dev (600 questions): lr 5e-5 0.788, **1e-4 0.805** (selected, pass 3), 3e-4 0.795; overfits after pass 3.
+- Rest of the chain: `scripts/run_td_night.sh`: LIDM test + context suite; references (Laya-TD, shipped Laya, LIDM
+  zero-shot); Laya fine-tuned by its own trainer on `data/td/train_laya.jsonl` (encoder lr 1.25e-5 / 2.5e-5 / 5e-5,
+  head 4x, 4 passes, dev-selected) + test + context suite; paired comparison (`scripts/compare_typed_decisions.py`);
+  leave one workflow out (`data/td/lowo_*`) for both at their selected settings.
+- Evaluation: `scripts/eval_typed_decisions.py` (accuracy with case-bootstrap CI, Brier vs soft targets, ECE, score
+  MAE, latency per case). Reference: laya-typed-decisions.
+- Decision: LIDM within 3 points of same-data Laya *and* one concrete advantage (calibration, latency per case,
+  regime-1 reading) -> stage 2; within 3 but no advantage -> try looping once; more than 3 below -> kill, write up.
+
+## Full LIDM-X training on the label-variety stage 1 (prepared 2026-11-21)
+
+`scripts/run_full_lidmx_loop.sh` (looped head, run C, loops sampled 1-4; stage 1 only; the unlooped variant was dropped): stage 1 = one full pass over `data/stage1b_train.jsonl` (522,691 questions, ~700k
+distinct option strings in the first 200k vs 2,089 in stage 1; 8.6 options and 249 tokens per question vs 3.6 and
+117) with `--option-attn state`, lr 1e-4, batch 128 / micro 16, `--max-len 512 --max-opt-len 64`, validation every 1,000
+steps on `stage1b_val` (zs/ 961, ood/ 1,500, heldout/ 1,936); then stage 2, typed decisions, context and label suites,
+2c, calibration, the abstain-wording test and both decision tables (vs Laya, vs `s2x-lidm`). Smoke: worst-case
+micro-batch fits at 4 loops; 13.7 s/step -> stage 1 ~16 h, ~16 h; stage 2 and the evaluations are not part of this script. Caveats: UTCD's CLINC150 is in the stage-1 base
+(CLINC numbers not zero-shot), and the stage-1 sources are not all commercial-clean (research run).
+
+## LIDM-DJ and LIDM-X with its own stage 1 (2026-11-20)
+
+- **LIDM-DJ** (`--option-attn dj --joint-layers 7`, `model._dj_forward`): layers 1-21 as LIDM (pass A and each option
+  alone, options at positions 0..L-1); layers 22-28 run every option jointly with a copy of its question's pass A,
+  `[A ; option]`, two-way attention, option positions continuing at len(A), copies isolated from other options; pass A
+  also continues alone for the head. `tests/test_lidmdj.py` checks both parts against HF's own forward / layer
+  modules. `--max-tokens` splits micro-batches by padded tokens (the joint layers hold one state copy per option).
+  Independent audit (fp64 tiny model, window shrunk to 8, joint 1/3/6): max error 4e-16 vs HF; it found budget and
+  memory issues only (padding-aware budget, budget in `validate`, contiguous joint slices, int32 window masks,
+  `bench_latency.py` refusing X/DJ checkpoints), all fixed.
+- **Chain** (`scripts/run_s1x.sh`, then `scripts/run_full_chain.sh`): LIDM-X stage 1 from scratch capped at 2,000
+  steps x 128 (time budget; the previous stage 1 plateaued from ~3,500 steps), LIDM-DJ stage 2 from the stage-1 MBL
+  checkpoint (same recipe as `s2-lidm` / `s2x-lidm`), then LIDM-X stage 2 from its own stage 1 (`s2xf-lidm`).
+
+## LIDM-X: options read pass A at every layer (built 2026-11-20)
+
+From `reports/Recovering interaction after late splits.md`. `--option-attn state` (`Encoder.encode_x`,
+`model._x_forward`): both passes run through ModernBERT's own layers (+ LoRA) in one loop; pass A attends to itself,
+each option row attends to [its question's pass-A keys/values at that layer ; its own tokens], never to other options;
+options start at position len(pass A) (shared, so order-free); local layers keep the |Δposition| <= 64 window on
+those positions. One option row per (question, option): no sharing of option strings across questions. No new
+parameters; head, layer mix and prior unchanged. `tests/test_lidmx.py` (fp32, gte-modernbert-base): pass A equals HF's
+forward; every option equals HF's layers on one packed `[A; option]` sequence with the LIDM-X mask at every layer;
+option order does not matter; LoRA gets gradients through both passes.
+
+Smoke (ModernBERT-large, stage-2 data): worst-case micro-batch 8 (40 options x 128 tokens) fits; 2.33 s/step vs 2.13
+for LIDM on the same slice (+9%); 69.6 ms per 5-question case. Run: `scripts/run_stage2_lidmx.sh` (stage 2 from the
+stage-1 MBL LoRA checkpoint exactly as `s2-lidm`, then typed decisions, context suite, label suite, 2c, paired
+comparisons; `scripts/summarize_lidmx.py` prints the decision table). Decision (from the report): adopt if the mean
+LIDM-X − Laya gap on VitaminC, RACE, Banking77 names and 13-40 options is at most half of today's (−8.1), with
+Banking77 descriptions >= +5 over Laya and typed decisions after 2c within 1.5 points.
+
+## Stage 2: same-data comparison on a commercial-clean decision mix (2026-11-19)
+
+`scripts/prepare_stage2.py` (`src/cls/data/stage2.py`) -> `data/stage2/`: 102,818 cases / 134,621 questions from
+365 label sources: typed-decisions-synth (MIT; 23k questions), Open-Jev release-v2 (CC0; 20k), tasksource-jev rows with
+`license_use == commercial` (61k, up to 250 per source, half option-rich), HelpSteer2 (15k score), Civil Comments (5k),
+Aegis 2.0 (10k). Held out: typed-decisions and its four workflows' domains, every context-suite task, Banking77,
+CLINC150, SST-5 (by source name), plus an exact state-prefix check against all evaluation items (5 dropped).
+Many and long options kept on purpose (up to 40 options, 600 characters each; 5.4% of questions have >12 options,
+3.6% have options >80 characters on average; ~95k distinct option strings): that is where late interaction should
+beat a packed joint encoder. Laya trains at `max_len 1024, head_max_len 512` (its long-option setting, like B3).
+
+- Training (`scripts/run_stage2_train.sh`): LIDM from stage-1 MBL LoRA, lr 1e-4, batch 32 (micro 8; 16 does not fit
+  40 options x 128 tokens), `--max-opt-len 128`, one pass, final checkpoint; Laya from shipped, its defaults, one pass.
+- Evaluation (`scripts/run_stage2_eval.sh`): typed-decisions test (schemas never trained on), context suite, label
+  suite (`--items`: 40 held-out tasksource sources, Banking77 N=77 names and `name: description`, CLINC150 N=150) with
+  accuracy by option count and option length; references stage-1 LIDM, shipped Laya, bge, gte. Then 2c: both
+  fine-tuned on typed-decisions train with the direct runs' recipes, compared with td-lidm / td-laya.
+
 ## Stage 2a: ablation grid (after stage 1, frozen encoder + layer mix)
 | Run | Head | Loops | Encoder | Question it answers |
 |---|---|---|---|---|

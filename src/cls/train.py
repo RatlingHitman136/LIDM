@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import itertools
 import json
 import math
 import os
@@ -70,8 +71,30 @@ def length_sorted(items: list[dict]) -> list[dict]:
     return sorted(items, key=lambda it: len(it["state"]) + len(it["instructions"]))
 
 
-def make_batch(items, index, device):
-    opts = [[index[t] for t in option_texts(it)] for it in items]
+def micro_batches(chunk: list[dict], size: int, max_tokens: int = 0, state_copies: bool = False):
+    """Micro-batches of at most `size` questions; with max_tokens, also cut before the padded encoder tokens would pass
+    it: (questions [+ option rows, with state_copies]) x longest state + option rows x longest option, with tokens ~
+    characters / 3 (conservative: number-heavy states run below 4 characters per token). state_copies: LIDM-DJ holds a
+    copy of the state per option, LIDM-X a copy of its keys/values per option (encode_x), so both count it."""
+    cur, rows, s_max, o_max = [], 0, 0.0, 0.0
+    for it in chunk:
+        opts = option_texts(it)
+        s = (len(it["state"]) + len(it["instructions"])) / 3
+        o = max(map(len, opts)) / 3 + 2
+        n_r, s_m, o_m = rows + len(opts), max(s_max, s), max(o_max, o)
+        cost = (len(cur) + 1 + (n_r if state_copies else 0)) * s_m + n_r * o_m
+        if cur and (len(cur) == size or (max_tokens and cost > max_tokens)):
+            yield cur
+            cur, n_r, s_m, o_m = [], len(opts), s, o
+        cur.append(it)
+        rows, s_max, o_max = n_r, s_m, o_m
+    if cur:
+        yield cur
+
+
+def make_batch(items, index, device, rows=None):
+    """rows: per item, its options' row indices (LIDM-X: one row per question and option); else via index."""
+    opts = rows or [[index[t] for t in option_texts(it)] for it in items]
     n = max(map(len, opts))
     opt_idx = torch.zeros(len(items), n, dtype=torch.long)
     opt_mask = torch.zeros(len(items), n, dtype=torch.bool)
@@ -103,7 +126,8 @@ def load_model(path, device="cuda"):
     st = torch.load(path, map_location=device)
     c = st["config"]
     enc = Encoder(c.get("encoder", ENCODER), max_len=c.get("max_len", 512), max_opt_len=c.get("max_opt_len", 64),
-                  lora_rank=c.get("encoder_lora") or 0)
+                  lora_rank=c.get("encoder_lora") or 0, option_attn=c.get("option_attn", "none"),
+                  joint_layers=c.get("joint_layers", 7))
     if c.get("encoder_lora"):
         enc.load_lora(st["encoder_lora"])
     enc.train(False)
@@ -128,23 +152,30 @@ def bge_prior(prior, items, n: int):
 def encode(enc, items, prior=None):
     """Pass A for the items, pass B for their distinct options. Returns model inputs + gold + is_score + the
     external prior (None without one)."""
-    texts = sorted({t for it in items for t in option_texts(it)})
-    index = {t: i for i, t in enumerate(texts)}
-    ha, a_mask = enc.encode_a([it["state"] for it in items], [it["instructions"] for it in items])
-    opt_h, opt_tok_mask = enc.encode_options(texts, enc.marker)
-    opt_idx, opt_mask, gold, is_score = make_batch(items, index, enc.device)
+    states, questions = [it["state"] for it in items], [it["instructions"] for it in items]
+    if enc.option_attn in ("state", "dj"):  # LIDM-X / -DJ: options depend on their question, no sharing
+        opts = [option_texts(it) for it in items]
+        ha, a_mask, opt_h, opt_tok_mask, _ = enc.encode_x(states, questions, opts)
+        start = [0, *itertools.accumulate(map(len, opts))]
+        rows = [list(range(start[i], start[i + 1])) for i in range(len(items))]
+        opt_idx, opt_mask, gold, is_score = make_batch(items, None, enc.device, rows=rows)
+    else:
+        texts = sorted({t for it in items for t in option_texts(it)})
+        index = {t: i for i, t in enumerate(texts)}
+        ha, a_mask = enc.encode_a(states, questions)
+        opt_h, opt_tok_mask = enc.encode_options(texts, enc.marker)
+        opt_idx, opt_mask, gold, is_score = make_batch(items, index, enc.device)
     cos = bge_prior(prior, items, opt_idx.shape[1]).to(enc.device) if prior else None
     return (ha, a_mask, opt_h, opt_tok_mask, opt_idx, opt_mask), gold, is_score, cos
 
 
 @torch.no_grad()
-def validate(model, enc, val, bs, loops_list, prior=None):
+def validate(model, enc, val, bs, loops_list, prior=None, max_tokens=0):
     model.eval()
     enc.train(False)
     sums = collections.defaultdict(float)
     counts = collections.defaultdict(int)
-    for s in range(0, len(val), bs):
-        chunk = val[s:s + bs]
+    for chunk in micro_batches(val, bs, max_tokens, enc.option_attn != "none"):
         inputs, gold, is_score, cos = encode(enc, chunk, prior)
         mask = inputs[-1]
         for loops in loops_list:  # encoder output reused across loop counts
@@ -237,6 +268,12 @@ def main():
     ap.add_argument("--option-vector", choices=("marker", "pooled"), default="marker",
                     help="score each option at a [MASK] marker, or with the encoder's own pooling (cls / mean)")
     ap.add_argument("--encoder-lora", type=int, default=0, help="LoRA rank on the encoder (0: frozen)")
+    ap.add_argument("--option-attn", choices=("none", "state", "dj"), default="none",
+                    help="'state' = LIDM-X: pass-B options attend to their question's pass A at every encoder layer; "
+                         "'dj' = LIDM-DJ: the top --joint-layers run [pass A ; option] jointly, per option")
+    ap.add_argument("--joint-layers", type=int, default=7, help="LIDM-DJ only: how many top encoder layers are joint")
+    ap.add_argument("--max-tokens", type=int, default=0,
+                    help="also split micro-batches above ~this many encoder tokens (0: off); for LIDM-DJ's state copies")
     ap.add_argument("--init", default=None, help="start from this checkpoint (head + encoder LoRA), e.g. B -> C")
     ap.add_argument("--max-len", type=int, default=512)
     ap.add_argument("--max-opt-len", type=int, default=64, help="token cap per option (pass B)")
@@ -275,7 +312,8 @@ def main():
     out_dir = ROOT / "checkpoints" / name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    enc = Encoder(a.encoder, max_len=a.max_len, max_opt_len=a.max_opt_len, lora_rank=a.encoder_lora)
+    enc = Encoder(a.encoder, max_len=a.max_len, max_opt_len=a.max_opt_len, lora_rank=a.encoder_lora,
+                  option_attn=a.option_attn, joint_layers=a.joint_layers)
     enc.train(True)
     model = LIDM(enc.d, enc.heads, enc.inter, enc.n_layers, preset["n_blocks"], preset["loops"], a.lora_rank,
                  dual_score=not a.no_dual_score,
@@ -326,7 +364,7 @@ def main():
 
         def evaluate(epoch: float):
             nonlocal best
-            v = validate(model, enc, val, a.micro_batch, val_loops, prior)
+            v = validate(model, enc, val, a.micro_batch, val_loops, prior, a.max_tokens)
             v["elapsed_min"] = (time.time() - t0) / 60
             tr.log_metrics(v, step=step)
             state = {"model": model.state_dict(), "config": cfg, "epoch": epoch, "step": step, "val": v}
@@ -347,8 +385,7 @@ def main():
                 # sampled depth per step (1 for unlooped runs), or always max_loops with --fixed-loops
                 loops = max_loops if a.fixed_loops else rng.randint(1, max_loops)
                 step_loss = 0.0
-                for m in range(0, len(chunk), a.micro_batch):
-                    mb = chunk[m:m + a.micro_batch]
+                for mb in micro_batches(chunk, a.micro_batch, a.max_tokens, a.option_attn != "none"):
                     drop = prior is not None and rng.random() < a.prior_dropout
                     inputs, gold, is_score, cos = encode(enc, mb, None if drop else prior)
                     if drop:  # zeros, not None: None would fall back to the in-model encoder cosine
@@ -379,7 +416,8 @@ def main():
         best_val = -best if a.select == "loss" else best
         tr.log_metrics({f"best_val_{a.select}": best_val, "train_wall_min": (time.time() - t0) / 60,
                         "peak_vram_gb": torch.cuda.max_memory_allocated() / 1e9})
-        print(f"[{name}] done: best val_{a.select} {best_val:.4f}, checkpoints in {out_dir}")
+        print(f"[{name}] done: best val_{a.select} {best_val:.4f}, checkpoints in {out_dir}; "
+              f"peak VRAM {torch.cuda.max_memory_allocated() / 1e9:.1f} GB")
 
 
 if __name__ == "__main__":

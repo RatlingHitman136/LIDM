@@ -39,6 +39,8 @@ def main():
     ap.add_argument("--max-len", type=int, default=None)
     ap.add_argument("--head-max-len", type=int, default=None)
     ap.add_argument("--loss", default="rlcd")
+    ap.add_argument("--encoder-lr", type=float, default=None, help="default: Laya's (2.5e-5)")
+    ap.add_argument("--head-lr", type=float, default=None, help="default: Laya's (1e-4)")
     ap.add_argument("--name", default="laya-b4")
     ap.add_argument("--no-track", action="store_true")
     a = ap.parse_args()
@@ -46,7 +48,8 @@ def main():
     import torch
     from laya.train import TrainConfig, finetune, resolve_checkpoint_dir
 
-    cfg = TrainConfig(epochs=a.epochs, max_len=a.max_len, head_max_len=a.head_max_len, loss=a.loss)
+    lrs = {k: v for k, v in (("encoder_lr", a.encoder_lr), ("head_lr", a.head_lr)) if v is not None}
+    cfg = TrainConfig(epochs=a.epochs, max_len=a.max_len, head_max_len=a.head_max_len, loss=a.loss, **lrs)
     tags = {"baseline_id": "B4", "model": "laya-finetuned", "milestone": "M0", "stage": "train",
             "question": "Laya fine-tuned with its own trainer on the shared mixture (Banking77 held out)"}
     with Tracker("baselines", a.name + "-train", tags=tags, enabled=not a.no_track) as tr:

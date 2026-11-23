@@ -27,7 +27,7 @@ class Encoder:
     trainable state_dict and the checkpoints; only the LoRA weights are saved (lora_state / load_lora)."""
 
     def __init__(self, name: str = ENCODER, device: str = "cuda", max_len: int = 512, max_opt_len: int = 64,
-                 lora_rank: int = 0):
+                 lora_rank: int = 0, option_attn: str = "none", joint_layers: int = 7):
         from transformers import AutoModel, AutoTokenizer
 
         self.tok = AutoTokenizer.from_pretrained(name)
@@ -49,6 +49,10 @@ class Encoder:
                                                          cfg.intermediate_size, cfg.num_hidden_layers)
         self.pooling = _pooling(name)
         self.marker = True  # pass B prepends the [MASK] marker; False for option_vector 'cls' / 'mean'
+        assert option_attn in ("none", "state", "dj"), option_attn
+        # 'state' = LIDM-X: options read pass A at every layer; 'dj' = LIDM-DJ: the top joint_layers run each
+        # option jointly with its question's pass A (both directions); both through encode_x
+        self.option_attn, self.joint_layers = option_attn, joint_layers
 
     @torch.no_grad()
     def embed(self, texts: list[str], max_length: int = 512):
@@ -100,6 +104,156 @@ class Encoder:
         if marker:
             assert (enc["input_ids"][:, MARKER_POS] == self.tok.mask_token_id).all()
         return self._layers(enc), enc["attention_mask"].bool()
+
+
+    def _base(self):
+        return self.model.get_base_model() if self.lora_rank else self.model
+
+    def encode_x(self, states: list[str], questions: list[str], options: list[list[str]]):
+        """LIDM-X. Pass A as in encode_a; pass B with one row per (question, option), since an option's states now
+        depend on its question: every option token also attends to its own question's pass-A keys and values at
+        every layer, never to other options. Equal to one packed pass [A; O_1; ...; O_N] with that mask, every
+        option starting at position len(A), so scores do not depend on option order (see _x_forward). Returns
+        (pass-A layers, a_mask, option layers, option token mask, owner); owner[u] = question of option row u."""
+        a = self.tok(states, questions, padding=True, truncation="only_first", max_length=self.max_len,
+                     return_tensors="pt").to(self.device)
+        texts = [f"{self.tok.mask_token} {t}" if self.marker else t for opts in options for t in opts]
+        o = self.tok(texts, padding=True, truncation=True, max_length=self.max_opt_len, return_tensors="pt").to(self.device)
+        if self.marker:
+            assert (o["input_ids"][:, MARKER_POS] == self.tok.mask_token_id).all()
+        owner = torch.tensor([i for i, opts in enumerate(options) for _ in opts], device=self.device)
+        a_mask, o_mask = a["attention_mask"].bool(), o["attention_mask"].bool()
+        with torch.set_grad_enabled(bool(self.lora_rank) and torch.is_grad_enabled()):
+            if self.option_attn == "dj":
+                ha, ho = _dj_forward(self._base(), a["input_ids"], a_mask, o["input_ids"], o_mask, owner, self.joint_layers)
+            else:
+                ha, ho = _x_forward(self._base(), a["input_ids"], a_mask, o["input_ids"], o_mask, owner)
+        return ha, a_mask, ho, o_mask, owner
+
+
+def _qkv_out(base):
+    """ModernBERT attention pieces as functions of (layer, x): q/k/v with RoPE, and the output projection."""
+    from transformers.models.modernbert.modeling_modernbert import apply_rotary_pos_emb
+
+    heads = base.config.num_attention_heads
+    hd = base.config.hidden_size // heads
+
+    def qkv(layer, x, cos_sin):
+        b, t, _ = x.shape
+        q, k, v = layer.attn.Wqkv(x).view(b, t, 3, heads, hd).unbind(2)
+        q, k = apply_rotary_pos_emb(q.transpose(1, 2), k.transpose(1, 2), *cos_sin)
+        return q, k, v.transpose(1, 2)
+
+    def out(layer, o):  # B x H x T x hd -> B x T x d
+        return layer.attn.Wo(o.transpose(1, 2).reshape(o.shape[0], o.shape[2], -1))
+
+    return qkv, out
+
+
+def _self_masks(real, pos, w):
+    """Masks for sequences that attend only within themselves: real B x T (key is a real token), pos B x T.
+    Global layers: every real key. Local layers: real keys with |pos_q - pos_k| <= w; the diagonal keeps padded
+    query rows finite (their outputs are never used)."""
+    t, pos = real.shape[1], pos.int()  # int32: the U x T x T difference is the largest temporary here
+    near = (pos[:, :, None] - pos[:, None, :]).abs() <= w
+    local = (real[:, None, None, :] & near[:, None]) | torch.eye(t, dtype=torch.bool, device=real.device)
+    return {"full_attention": real[:, None, None, :], "sliding_attention": local}
+
+
+def _dj_forward(base, a_ids, a_mask, o_ids, o_mask, owner, joint):
+    """LIDM-DJ (DeFormer-style deferred joint layers). Layers 1..L-joint: pass A and every option alone, each option
+    at its own positions 0..L_o-1 (as LIDM's pass B, so lower-layer option states depend only on the option).
+    Layers L-joint+1..L: each option row runs jointly with a copy of its question's pass A, [A ; option] with full
+    two-way attention (the state reads the option, the option reads the state), the option continuing at positions
+    S.. (S = its question's real length); copies never see other options. Pass A also continues alone through the
+    top layers, for the layer mix and the head's cross-attention. Returns per-layer outputs like _x_forward."""
+    from torch.utils.checkpoint import checkpoint
+
+    cfg = base.config
+    qkv, out = _qkv_out(base)
+    w, dev, n_layers = cfg.sliding_window, a_ids.device, len(base.layers)
+    split = n_layers - joint
+    assert 0 < joint <= n_layers, joint
+    (b, ta), (u, to) = a_ids.shape, o_ids.shape
+    pos_a = torch.arange(ta, device=dev)[None].expand(b, -1)
+    pos_o = torch.arange(to, device=dev)[None].expand(u, -1)
+    pos_j = torch.cat([pos_a[owner], a_mask.sum(1)[owner][:, None] + pos_o], 1)  # U x (Ta + To)
+    masks = {"a": _self_masks(a_mask, pos_a, w), "o": _self_masks(o_mask, pos_o, w),
+             "j": _self_masks(torch.cat([a_mask[owner], o_mask], 1), pos_j, w)}
+    h_a, h_o = base.embeddings(input_ids=a_ids), base.embeddings(input_ids=o_ids)
+    rope = {(k, lt): base.rotary_emb(h_a, pos, lt) for k, pos in (("a", pos_a), ("o", pos_o), ("j", pos_j))
+            for lt in set(cfg.layer_types)}
+
+    def block(layer, h, key):  # one ModernBERT layer on sequences that attend within themselves
+        lt = layer.attention_type
+        q, k, v = qkv(layer, layer.attn_norm(h), rope[key, lt])
+        h = h + out(layer, F.scaled_dot_product_attention(q, k, v, attn_mask=masks[key][lt]))
+        return h + layer.mlp(layer.mlp_norm(h))
+
+    def low(layer, h_a, h_o):
+        return block(layer, h_a, "a"), block(layer, h_o, "o")
+
+    def high(layer, h_a, h_j):
+        return block(layer, h_a, "a"), block(layer, h_j, "j")
+
+    ckpt = torch.is_grad_enabled() and base.training
+    outs_a, outs_o = [], []
+    for i, layer in enumerate(base.layers):
+        if i == split:
+            h_o = torch.cat([h_a[owner], h_o], 1)  # joint copies [A ; option] from here on
+        fn = low if i < split else high
+        h_a, h_o = checkpoint(fn, layer, h_a, h_o, use_reentrant=False) if ckpt else fn(layer, h_a, h_o)
+        outs_a.append(h_a)
+        outs_o.append(h_o if i < split else h_o[:, ta:].contiguous())  # a view would keep every joint copy alive
+    outs_a[-1], outs_o[-1] = base.final_norm(h_a), base.final_norm(h_o[:, ta:])
+    return tuple(outs_a), tuple(outs_o)
+
+
+def _x_forward(base, a_ids, a_mask, o_ids, o_mask, owner):
+    """Both passes through ModernBERT's own layers (+ LoRA), layer by layer: pass A attends to itself only, so its
+    keys/values do not depend on the options; each option row attends to [its question's pass-A keys/values at that
+    layer ; its own tokens]. Positions: pass A 0..S-1, every option S..S+L-1 (S = its question's real length), and
+    local layers keep HF's bidirectional window |pos_q - pos_k| <= sliding_window on those positions. Returns the 28
+    per-layer outputs of each pass, as Encoder._layers does (embedding output dropped, final norm on the last)."""
+    from torch.utils.checkpoint import checkpoint
+
+    cfg = base.config
+    qkv, out = _qkv_out(base)
+    w, dev = cfg.sliding_window, a_ids.device
+    ta, to = a_ids.shape[1], o_ids.shape[1]
+    pos_a = torch.arange(ta, device=dev)
+    pos_o = a_mask.sum(1)[owner][:, None] + torch.arange(to, device=dev)  # U x To
+    # True = may attend; the diagonal only keeps padded query rows finite (their outputs are never used)
+    full_a = a_mask[:, None, None, :] | torch.eye(ta, dtype=torch.bool, device=dev)
+    local_a = full_a & ((pos_a[:, None] - pos_a[None]).abs() <= w)
+    to_a = a_mask[owner][:, None, None, :]
+    to_o = o_mask[:, None, None, :] | torch.eye(to, dtype=torch.bool, device=dev)
+    near_a = ((pos_o[:, :, None] - pos_a[None, None]).abs() <= w)[:, None]
+    near_o = ((pos_o[:, :, None] - pos_o[:, None]).abs() <= w)[:, None]
+    masks = {"full_attention": (full_a, torch.cat([to_a.expand(-1, -1, to, -1), to_o], -1)),
+             "sliding_attention": (local_a, torch.cat([to_a & near_a, to_o & near_o], -1))}
+    h_a, h_o = base.embeddings(input_ids=a_ids), base.embeddings(input_ids=o_ids)
+    rope = {lt: (base.rotary_emb(h_a, pos_a[None].expand(len(a_ids), -1), lt), base.rotary_emb(h_o, pos_o, lt))
+            for lt in set(cfg.layer_types)}
+
+    def step(layer, h_a, h_o):
+        (r_a, r_o), (m_a, m_o) = rope[layer.attention_type], masks[layer.attention_type]
+        q_a, k_a, v_a = qkv(layer, layer.attn_norm(h_a), r_a)
+        q_o, k_o, v_o = qkv(layer, layer.attn_norm(h_o), r_o)
+        att_o = F.scaled_dot_product_attention(q_o, torch.cat([k_a[owner], k_o], 2), torch.cat([v_a[owner], v_o], 2),
+                                               attn_mask=m_o)
+        h_a = h_a + out(layer, F.scaled_dot_product_attention(q_a, k_a, v_a, attn_mask=m_a))
+        h_o = h_o + out(layer, att_o)
+        return h_a + layer.mlp(layer.mlp_norm(h_a)), h_o + layer.mlp(layer.mlp_norm(h_o))
+
+    ckpt = torch.is_grad_enabled() and base.training  # recompute each layer in backward, as HF does with LoRA
+    outs_a, outs_o = [], []
+    for layer in base.layers:
+        h_a, h_o = checkpoint(step, layer, h_a, h_o, use_reentrant=False) if ckpt else step(layer, h_a, h_o)
+        outs_a.append(h_a)
+        outs_o.append(h_o)
+    outs_a[-1], outs_o[-1] = base.final_norm(h_a), base.final_norm(h_o)  # HF's last hidden state is after final_norm
+    return tuple(outs_a), tuple(outs_o)
 
 
 def _pooling(name: str) -> str:

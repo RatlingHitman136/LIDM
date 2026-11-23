@@ -10,6 +10,7 @@ import contextlib
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch import nn
 
 
@@ -76,6 +77,9 @@ class FusionHead(nn.Module):
     def __init__(self, d=1024, heads=16, inter=2624, n_blocks=2, max_loops=1, lora_rank=0):
         super().__init__()
         self.max_loops = max_loops
+        # looped heads keep every loop's activations for backward (questions x option tokens x loops: ~10 GB for 16
+        # questions with 24 long options at 4 loops); recompute each block in backward instead, as the encoder does
+        self.checkpoint = max_loops > 1
         rank = lora_rank if max_loops > 1 else 0
         self.blocks = nn.ModuleList(FusionBlock(d, heads, inter, max_loops, rank) for _ in range(n_blocks))
         self.norm = nn.LayerNorm(d, bias=False)
@@ -93,7 +97,10 @@ class FusionHead(nn.Module):
                 if k:
                     x = x + x0  # input injection: re-add the original option encodings every loop
                 for b in self.blocks:
-                    x = b(x, x_mask, ctx, ctx_mask, k)
+                    if self.checkpoint and self.training and torch.is_grad_enabled():
+                        x = torch.utils.checkpoint.checkpoint(b, x, x_mask, ctx, ctx_mask, k, use_reentrant=False)
+                    else:
+                        x = b(x, x_mask, ctx, ctx_mask, k)
         return self.norm(x)
 
     @torch.no_grad()

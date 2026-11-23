@@ -22,6 +22,7 @@ a = ap.parse_args()
 
 enc, m, prior, st = load_model(a.ckpt)
 c = st["config"]
+assert c.get("option_attn", "none") == "none", "bench_latency times encode_a/encode_options; LIDM-X/DJ go through encode_x"
 assert prior is None, "external retrieval priors are not timed here"
 items = banking77_items(None, n=max(a.calls + 10, a.check), seed=0)
 labels = items[0]["criteria"]

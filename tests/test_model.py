@@ -145,3 +145,29 @@ def test_pooled_option_vectors_match_padded_reference():
         vec = x[:, :, 0] if mode == "cls" else _masked_mean(x, tok)
         ref = (m.scorer(vec).squeeze(-1) + m.dual_scale * p).masked_fill(~mask, float("-inf"))
         assert torch.allclose(m(ha, a_mask, ch, cm, idx, mask, prior=p), ref, atol=1e-5), mode
+
+
+def test_looped_head_checkpointing_is_exact():
+    """Recomputing looped head blocks in backward (memory fix) gives the same outputs and gradients."""
+    import torch
+
+    from cls.head import FusionHead
+
+    torch.manual_seed(0)
+    h = FusionHead(d=32, heads=4, inter=48, n_blocks=2, max_loops=4, lora_rank=4).train()
+    for blk in h.blocks:  # per-loop LoRA starts at zero; give it weight so every loop differs
+        for n, prm in blk.named_parameters():
+            if ".B" in n or n.endswith("B"):
+                torch.nn.init.normal_(prm, std=0.1)
+    x0, ctx = torch.randn(3, 7, 32), torch.randn(3, 5, 32)
+    x_mask, ctx_mask = torch.rand(3, 7) > 0.2, torch.ones(3, 5, dtype=torch.bool)
+    outs, grads = [], []
+    for ck in (False, True):
+        h.checkpoint = ck
+        h.zero_grad()
+        y = h(x0, x_mask, ctx, ctx_mask, loops=4)
+        y.pow(2).mean().backward()
+        outs.append(y.detach())
+        grads.append([p.grad.clone() for p in h.parameters() if p.grad is not None])
+    assert torch.allclose(outs[0], outs[1], atol=1e-6)
+    assert len(grads[0]) == len(grads[1]) and all(torch.allclose(a, b, atol=1e-6) for a, b in zip(*grads))

@@ -4,7 +4,73 @@ Ideas and known issues that were deliberately **not** done yet, with the evidenc
 fixes. Ordered by priority within each section. When an item is tried, move the result to
 [RESULTS.md](RESULTS.md) and the decision to [ARCHITECTURE.md](ARCHITECTURE.md) / [EXPERIMENTS.md](EXPERIMENTS.md).
 
-## Focus (decides whether the project works)
+## Quality levers after stage 2 (2026-11-19)
+
+Same-data results (RESULTS.md, "Kill-criterion test" and "Stage 2"): LIDM ties Laya on typed decisions (0.769 vs
+0.757 after stage 2 + 2c), is better calibrated after a temperature step, loses where options must be checked
+against fine detail (VitaminC −7, RACE −5) and with many short options (Banking77 names −11, 13-40 options −9),
+wins with many long options (Banking77 descriptions +11), and both lose to bge on label matching. The base encoder
+is not the main limit (Laya, same encoder, does better exactly where the late split removes token-level access).
+**LIDM-X adopted 2026-11-20** (RESULTS.md: gap to Laya on the rows LIDM lost −8.1 -> +2.7; VitaminC still −6, so LIDM-DJ / state-reads-option is the next architecture test). Architectures against the late split: see `reports/Recovering interaction after late splits.md` (recommends LIDM-X, options attending to pass A's keys/values at every layer, vs LIDM-DJ, joint top 7 layers).
+
+Ordered by expected value for cost:
+1. **Soft targets / teacher distillation.** All runs so far use hard labels (`decision_loss` = CE + 0.5 RPS).
+   Soft sources already in reach: typed-decisions-synth's DeepSeek teacher distributions, typed-decisions' soft gold,
+   Open-Jev / tasksource-jev targets. Loss: KL(target ‖ model) (+ 0.5 RPS for score); Laya's trainer reads `gold`
+   distributions natively, so both models can train on the same targets. Expect large Brier / AUROC gains (Laya-TD,
+   soft-trained: Brier 0.061 vs ours 0.12-0.15) and +1-2 accuracy. ~small code change + 2.5 h run.
+2. **More stage-2 training + ~20% stage-1 replay.** Stage-2 dev accuracy still rising at the end of the single
+   pass (0.597 -> 0.655); LIDM forgot label tasks (Banking77 names 0.447 -> 0.434, CLINC150 0.795 -> 0.690). A second
+   pass from `checkpoints/s2-lidm/last.pt` with replay; can share a run with item 1. ~2.5 h per pass.
+3. **Retrieval prior for label sets.** bge alone 0.62-0.70 on Banking77 vs LIDM 0.43-0.47. Use `--prior bge`
+   (or gte) where options are labels, fit the weight with `scripts/fit_prior_weight.py`; test at inference on the
+   stage-2 checkpoint first (~30-60 min), retrain with the prior (and `--prior-dropout`) only if it helps.
+4. **Targeted data for fine-detail reasoning.** Commercial-clean minimal pairs (one changed fact flips the answer,
+   Nimble-style), multiple-choice reading data with near-miss distractors. Current mix has neither (RACE / QuAIL /
+   VitaminC are evaluation-only, and RACE / QuAIL are non-commercial).
+5. **Looping (C vs B) on the stage-2 mix**, initialised from stage 1 (per-loop LoRA zero-init), evaluated on the
+   reasoning tasks (VitaminC, RACE, ANLI, CondaQA). Decide: >= 3 points over the single pass on those, or drop it.
+   ~3 h training.
+6. **Encoder upgrade, after the late-split fix.** Planned (2026-11-20): retrain everything on a newer encoder once
+   LIDM-X is decided. First candidate **UltraBERT-380M** (dmis-lab, Apache-2.0, Oct 2026; 24 layers, 1,024 wide,
+   8 x 128 heads, SwiGLU, RMSNorm, local ±128 / global every 3rd layer, 32k context; native in transformers 5.22).
+   Self-reported vs ModernBERT-large: GLUE 91.0 vs 90.4, SQuAD 2.0 90.9 vs 89.8, RewardBench 78.8 vs 72.8, RAR-b
+   47.0/61.7 vs 34.0/46.1. Port: LoRA targets `q/k/v/o_proj, gate/up/down_proj`; head init from separate projections
+   with a SiLU head FFN; LIDM-X loop for its module names (no embedding norm, final `norm`); `[MASK]`-marker works
+   (`<|endoftext|> <|mask|> option`). Needs a same-backbone joint control (Laya's trainer is ModernBERT/mmBERT).
+   UltraBERT-Embed-150M (MTEB v2 67.24) is the candidate retrieval prior for item 3. Others: DeBERTa-v3-large, Ettin-1B.
+7. **Laya's option budget is a setting, not a backbone limit.** Laya gives each option (head_max_len − 16) / N
+   tokens; ModernBERT reads 8,192. Our Laya ran at head_max_len 512 (6 tokens per option at N = 77), so LIDM's +11 on
+   Banking77 descriptions may be partly that setting. Before claiming it: evaluate Laya at head_max_len ~2,560 /
+   max_len 4,096, and for the final comparison train Laya at the larger budget too.
+
+8. **Abstain-option bias (2026-11-20).** LIDM-X over-picks "don't know" / "the text does not say" / "neutral"-type
+   options, and the triggering wording flips between runs (CondaQA 0.58 vs 0.23 for the same model with two wordings;
+   RESULTS.md). Evaluate abstain options in several wordings (report mean and worst); in training, paraphrase abstain
+   options, balance how often they are gold, add contrastive cases where abstaining is wrong, and describe the option
+   ("don't know: the passage does not give enough information"). Design alternative: abstain = low calibrated
+   confidence, not an option. Tested at inference (RESULTS.md, "Abstain options with descriptions"): descriptions
+   shift the abstain rate in model- and wording-dependent directions, not a fix; describing all options is the safest.
+   Next: abstain-by-confidence on CondaQA (score only yes/no, threshold on calibrated confidence), and option-to-option
+   attention in a few top encoder layers (abstaining is relative to the other options).
+
+Smaller items from the same runs:
+- **Temperature step as standard** (stage 3b): one temperature per question type fitted on held-out cases took
+  LIDM's ECE 0.135 -> 0.041 and Brier 0.221 -> 0.123 (raw LIDM is overconfident, T = 2-3). Needs a calibration set
+  larger than 120 cases: dev-chosen thresholds undershoot their target accuracy on test by 2-4 points.
+- **Encode the state once per case**, not once per question (pass A is `state + question`): LIDM is 64 ms vs
+  Laya's 44 ms per 5-question case. Options: cache the state's layers and append the question, or put all of a
+  case's questions in one pass A.
+- **Minimal-pair consistency metric** (CondaQA edit groups, VitaminC pairs): is every version of a pair right?
+  A sharper test of understanding than accuracy; ~30 min, no training.
+- **Remove CLINC150 from the stage-1 data** (UTCD `clinc_150`): it makes every CLINC150 number for LIDM
+  in-domain (stage-1 LIDM 0.795).
+- **Selection asymmetry**: LIDM keeps its best pass on dev, Laya's trainer its final checkpoint. Refit Laya with
+  3 passes (or save per pass) before reading small gaps as real.
+- **Confidence intervals** for calibration and selective-prediction numbers (bootstrap by case), and by source
+  for the held-out label sets.
+
+## Focus before stage 2 (superseded 2026-11-19, kept for history)
 1. **Banking77 zero-shot.** The primary goal (GOALS.md: >= 0.70 at N=77). Stage 1 with encoder LoRA reached
    0.434 (0.641 at N=20); frozen it was 0.044. Judge on the Banking77 test and `val_acc/zs/*`, never on
    in-distribution val.
@@ -77,9 +143,8 @@ How to test: A/B in a stage-1 pilot (~500 steps, ~6 min each), same LR, compare 
 - **Early exit** for looped heads (stop when successive option distributions agree): not built.
 
 ## Training infrastructure
-- **`--init <checkpoint>` in `cls.train`**: needed for stage 2a and for starting looped C from B. Every
-  run currently starts a fresh head.
-- **Soft targets** in `decision_loss` (KL to a distribution): needed for stage 2 (jev-distill) and 3a.
+- ~~**`--init <checkpoint>` in `cls.train`**~~: built (head + encoder LoRA; B -> C with zero-init per-loop LoRA).
+- **Soft targets** in `decision_loss` (KL to a distribution): still not built; see "Quality levers" item 1.
 - **Fixed layer mix after the pilot** (the design doc's plan): frees the ~1 GB of saved per-layer fp32 states
   per pass and makes both passes cacheable (~2 KB per token).
 - **Option cache**: all 2,118 stage-1 options at 28 layers is ~2 GB if stored unpadded (mean 16 tokens); would
@@ -92,7 +157,7 @@ How to test: A/B in a stage-1 pilot (~500 steps, ~6 min each), same LR, compare 
   unpadded.
 
 ## Evaluation gaps
-- LIDM through `cls.eval.harness` (BoolQ, SST-5, AG News, Emotion, N-sweep, calibration), not only Banking77.
-- Latency benchmark (fresh vs cached options, N in {5, 20, 77, 255}).
+- ~~LIDM through `cls.eval.harness`~~ done (M0 eval, context suite, label suite, typed decisions).
+- ~~Latency benchmark~~ done (`scripts/bench_latency.py`; per-case latency in the typed-decisions eval).
 - Temperature fitting (stage 3b) and ECE per (type, option-count bucket).
 - More than one seed for any result that decides a design question.
