@@ -10,6 +10,7 @@ evaluation item (typed-decisions test, the context suite as evaluated, the sets 
 import collections
 import json
 import random
+import sys
 
 from cls.data import stage2
 from cls.data.banking77 import INSTRUCTION as B77
@@ -33,7 +34,7 @@ for name, got in [("tdsynth", stage2.tdsynth_cases(rng)), ("openjev", rng.sample
     print(f"{name}: {len(got)} cases, {sum(len(c['questions']) for c in got)} questions", flush=True)
     cases += got
 
-out = ROOT / "data" / "stage2"
+out = ROOT / "data" / (sys.argv[1] if len(sys.argv) > 1 else "stage2")  # optional: output folder under data/
 evals = {"eval_heldout_sources": [dict(it, task=f"heldout/{c['source'].split('/', 1)[1]}") for c in ts_held for it in stage2.lidm_items(c)]}
 b77 = load_banking77("test", n=1000, seed=0)
 desc = json.loads((ROOT / "src" / "cls" / "data" / "banking77_descriptions.json").read_text())

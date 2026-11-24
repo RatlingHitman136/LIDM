@@ -106,6 +106,18 @@ def make_batch(items, index, device, rows=None):
     return [t.to(device) for t in (opt_idx, opt_mask, gold, is_score)]
 
 
+def soft_target(items, n: int, device):
+    """Q x N target distributions: an item's `soft` (normalised, in option order) where it has one, else one-hot."""
+    t = torch.zeros(len(items), n)
+    for i, it in enumerate(items):
+        s = it.get("soft")
+        if s and sum(s) > 0:
+            t[i, : len(s)] = torch.tensor(s, dtype=torch.float) / sum(s)
+        else:
+            t[i, it["gold"]] = 1.0
+    return t.to(device)
+
+
 def make_prior(kind: str, enc):
     """External retrieval scorer for the dual_score term, or None for the encoder's in-model cosine. 'bge' =
     bge-base-en-v1.5 (M0 B5b); 'self' = this encoder's own retrieval embedding with LoRA off (Encoder.embed)."""
@@ -272,6 +284,8 @@ def main():
                     help="'state' = LIDM-X: pass-B options attend to their question's pass A at every encoder layer; "
                          "'dj' = LIDM-DJ: the top --joint-layers run [pass A ; option] jointly, per option")
     ap.add_argument("--joint-layers", type=int, default=7, help="LIDM-DJ only: how many top encoder layers are joint")
+    ap.add_argument("--soft-targets", action="store_true",
+                    help="train on items' `soft` distributions where present (else one-hot); validation stays hard")
     ap.add_argument("--max-tokens", type=int, default=0,
                     help="also split micro-batches above ~this many encoder tokens (0: off); for LIDM-DJ's state copies")
     ap.add_argument("--init", default=None, help="start from this checkpoint (head + encoder LoRA), e.g. B -> C")
@@ -392,7 +406,8 @@ def main():
                         cos = torch.zeros(inputs[4].shape, device=inputs[4].device)
                     with torch.autocast("cuda", dtype=torch.bfloat16):
                         logits = model(*inputs, loops=loops, prior=cos)
-                    loss = decision_loss(logits, gold, inputs[-1], is_score) * len(mb) / len(chunk)
+                    target = soft_target(mb, logits.shape[1], logits.device) if a.soft_targets else None
+                    loss = decision_loss(logits, gold, inputs[-1], is_score, target=target) * len(mb) / len(chunk)
                     loss.backward()
                     step_loss += loss.item()
                 torch.nn.utils.clip_grad_norm_(params, 1.0)

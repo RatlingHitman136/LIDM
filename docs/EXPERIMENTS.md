@@ -113,6 +113,19 @@ typed decisions (2-4 options). Both sides ModernBERT-large, fine-tuned on LocalL
 - Decision: LIDM within 3 points of same-data Laya *and* one concrete advantage (calibration, latency per case,
   regime-1 reading) -> stage 2; within 3 but no advantage -> try looping once; more than 3 below -> kill, write up.
 
+## Next stages on LIDM-X: soft targets, then a second pass with stage-1 replay (prepared 2026-11-23)
+
+`scripts/run_s2_soft_replay.sh`, both from `checkpoints/s2x-lidm` at lr 5e-5, otherwise the `s2x-lidm` recipe:
+- **Soft targets** (`s2xs-lidm`, `--soft-targets`, `decision_loss(target=...)`, `train.soft_target`): one more stage-2
+  pass on `data/stage2_soft/train.jsonl` (`scripts/prepare_stage2.py stage2_soft`; same questions, options, gold and
+  order as `data/stage2/train.jsonl`, verified), 81% of questions carry a distribution, 26k (19%) not one-hot:
+  typed-decisions-synth teacher 21.2k, Civil Comments rater share 2.25k, tasksource 2.5k. Then 2c on typed-decisions
+  train with its soft gold (`s2xsc-lidm`) vs the hard 2c (`s2xc-lidm`); calibration and selective prediction.
+- **Replay** (`s2xr-lidm`): one more pass, hard labels, `data/stage2/train_replay.jsonl` (`scripts/prepare_stage2_replay.py`:
+  134,621 stage-2 + 33,655 stage-1 questions = 20% replay; replay is 62% NLI / label-NLI).
+- Both are second passes, so each shows "second pass + its ingredient" against `s2x-lidm`; a hard second pass without
+  replay would be the control separating the two.
+
 ## Full LIDM-X training on the label-variety stage 1 (prepared 2026-11-21)
 
 `scripts/run_full_lidmx_loop.sh` (looped head, run C, loops sampled 1-4; stage 1 only; the unlooped variant was dropped): stage 1 = one full pass over `data/stage1b_train.jsonl` (522,691 questions, ~700k

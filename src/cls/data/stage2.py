@@ -31,7 +31,8 @@ def _ok_options(opts) -> bool:
             and sum(map(len, opts)) <= MAX_ALL_OPT_CHARS)
 
 
-def _case(source, state, questions, expected) -> dict | None:
+def _case(source, state, questions, expected, soft=None) -> dict | None:
+    """soft: optional {qid: target distribution in the order LIDM sees the options} (noul: [P(no), P(yes)])."""
     keep = {}
     for qid, q in questions.items():
         if qid not in expected or len(q.get("instructions", "")) > 400:
@@ -46,8 +47,17 @@ def _case(source, state, questions, expected) -> dict | None:
         keep[qid] = q
     if not keep or not state:
         return None
-    return {"source": source, "state": str(state)[:MAX_STATE_CHARS], "questions": keep,
+    case = {"source": source, "state": str(state)[:MAX_STATE_CHARS], "questions": keep,
             "expected": {k: expected[k] for k in keep}}
+    soft = {k: _norm(soft[k]) for k in keep if soft and soft.get(k) and sum(soft[k]) > 0}
+    if soft:
+        case["soft"] = soft
+    return case
+
+
+def _norm(xs) -> list[float]:
+    total = sum(xs)
+    return [round(x / total, 5) for x in xs]
 
 
 def jev_case(source: str, r: dict) -> dict | None:
@@ -58,14 +68,14 @@ def jev_case(source: str, r: dict) -> dict | None:
         p = t[-1] if len(t) in (1, 2) else None
         if p is None or 0.35 < p < 0.65:
             return None
-        q, exp = {"type": "noul", "instructions": r["question"]}, p >= 0.5
+        q, exp, soft = {"type": "noul", "instructions": r["question"]}, p >= 0.5, [1 - p, p]
     elif kind in ("choice", "score") and len(t) == len(opts):
         top = sorted(t, reverse=True)
         if top[0] < 0.5 or top[0] == top[1]:
             return None
         i = t.index(top[0])
         q = {"type": kind, "instructions": r["question"], "criteria": opts}
-        exp = opts[i] if kind == "choice" else i
+        exp, soft = (opts[i] if kind == "choice" else i), t
     else:
         return None
     state = r.get("state") or r.get("state_json")
@@ -74,7 +84,7 @@ def jev_case(source: str, r: dict) -> dict | None:
             state = json.loads(state)
         except ValueError:
             pass
-    return _case(source, state, {"q": q}, {"q": exp})
+    return _case(source, state, {"q": q}, {"q": exp}, {"q": soft})
 
 
 def tdsynth_cases(rng: random.Random) -> list[dict]:
@@ -82,12 +92,23 @@ def tdsynth_cases(rng: random.Random) -> list[dict]:
     for r in _load("n4ze3m/typed-decisions-synth", None, "train"):
         if TD_DOMAINS.search(r["domain"]):
             continue
-        qs, gold = json.loads(r["questions"]), json.loads(r["gold"])
+        qs, gold, teacher = json.loads(r["questions"]), json.loads(r["gold"]), json.loads(r["teacher"] or "{}")
         exp = {k: (str(v) if qs.get(k, {}).get("type") == "choice" else v) for k, v in gold.items()}
-        c = _case("tdsynth", r["state"], qs, exp)
+        c = _case("tdsynth", r["state"], qs, exp, {k: _teacher_soft(q, teacher.get(k)) for k, q in qs.items()})
         if c:
             out.append(c)
     return out
+
+
+def _teacher_soft(q: dict, t: dict | None) -> list[float] | None:
+    """DeepSeek teacher distribution of a typed-decisions-synth question, in LIDM's option order."""
+    if not t:
+        return None
+    if q["type"] == "noul":
+        return [1 - t["noul"], t["noul"]] if "noul" in t else None
+    probs, crit = t.get("probabilities") or {}, q.get("criteria") or []
+    keys = [str(n) for n in crit] if q["type"] == "choice" else [str(i) for i in range(len(crit))]
+    return [float(probs.get(k, 0.0)) for k in keys]
 
 
 def openjev_cases(rng: random.Random) -> list[dict]:
@@ -161,7 +182,8 @@ def civil_cases(rng: random.Random, n: int = 8000, pos_share: float = 0.35) -> l
     neg = [i for i, t in enumerate(tox) if t <= 0.3]
     idx = rng.sample(pos, int(n * pos_share)) + rng.sample(neg, n - int(n * pos_share))
     q = {"toxic": {"type": "noul", "instructions": "This comment is toxic: rude, disrespectful or unreasonable."}}
-    return [c for i in idx if (c := _case("civil_comments", ds[i]["text"], q, {"toxic": tox[i] >= 0.6}))]
+    return [c for i in idx if (c := _case("civil_comments", ds[i]["text"], q, {"toxic": tox[i] >= 0.6},
+                                           {"toxic": [1 - tox[i], tox[i]]}))]  # rater share as P(toxic)
 
 
 def aegis_cases(rng: random.Random, n: int = 7000) -> list[dict]:
@@ -183,7 +205,8 @@ def aegis_cases(rng: random.Random, n: int = 7000) -> list[dict]:
 
 
 def lidm_items(case: dict) -> list[dict]:
-    """One LIDM item per question; dict criteria become `name: description` options, as for typed-decisions."""
+    """One LIDM item per question; dict criteria become `name: description` options, as for typed-decisions. Items
+    whose source has a target distribution carry it as `soft` (same order as the options; noul: [P(no), P(yes)])."""
     out = []
     for qid, q in case["questions"].items():
         base = {"task": f"s2/{case['source'].split('/')[0]}", "type": q["type"], "state": case["state"],
@@ -197,4 +220,6 @@ def lidm_items(case: dict) -> list[dict]:
             names = list(crit)
             opts = [f"{k}: {crit[k]}" for k in names] if isinstance(crit, dict) else [str(c) for c in names]
             out.append(dict(base, criteria=opts, gold=names.index(exp)))
+        if case.get("soft", {}).get(qid):
+            out[-1]["soft"] = case["soft"][qid]
     return out

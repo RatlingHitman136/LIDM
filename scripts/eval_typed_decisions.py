@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from cls import calibration
 from cls.data.typed import _load
 from cls.metrics import ece
 from cls.tracking import ROOT, Tracker
@@ -27,9 +28,11 @@ ap.add_argument("model", choices=["lidm", "laya"])
 ap.add_argument("--ckpt", required=True, help="lidm: .pt; laya: hub id or local dir")
 ap.add_argument("--name", required=True)
 ap.add_argument("--test", default=str(ROOT / "data" / "td" / "test.jsonl"))
+ap.add_argument("--temps", help="stage-3b temperatures.json to apply (cls.calibration) before scoring")
 ap.add_argument("--no-track", action="store_true")
 a = ap.parse_args()
 
+temps = calibration.load(a.temps) if a.temps else None
 items = read_jsonl(a.test)
 cases = collections.defaultdict(list)
 for it in items:
@@ -75,7 +78,7 @@ for i, (cid, cit) in enumerate(cases.items()):
     if i >= 5:  # warm-up
         lat.append((time.perf_counter() - t) * 1000)
     for it, p in zip(cit, ps):
-        probs[(cid, it["qid"])] = p / p.sum()
+        probs[(cid, it["qid"])] = calibration.apply(p / p.sum(), it["type"], temps) if temps else p / p.sum()
 
 P = [probs[(it["case"], it["qid"])] for it in items]
 correct = np.array([p.argmax() == it["gold"] for p, it in zip(P, items)], dtype=float)

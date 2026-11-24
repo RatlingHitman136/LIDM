@@ -719,6 +719,109 @@ LIDM 0.435-0.599; bge 0.695 / 0.844.
 
 ---
 
+## Next stages on LIDM-X: soft targets and stage-1 replay (2026-11-24)
+
+`scripts/run_s2_soft_replay.sh`; both runs start from `s2x-lidm`, one more stage-2 pass at lr 5e-5 (soft 2h18, replay
+2h47). Paired 95% CIs by resampling questions (typed decisions: cases).
+
+**Typed decisions** (400 cases / 2,000 questions):
+
+| Model | Accuracy | Brier vs soft gold (raw) | ECE raw -> calibrated | Brier calibrated | score MAE | AUROC (cal.) |
+|---|---|---|---|---|---|---|
+| s2x-lidm (stage 2, hard) | 0.550 | 0.217 | 0.103 | | 0.425 | |
+| s2xs-lidm (+ soft pass) | 0.551 | 0.187 | 0.085 | | 0.455 | |
+| s2xr-lidm (+ replay pass) | 0.545 | 0.260 | 0.172 | | 0.438 | |
+| s2xc-lidm (hard 2c) | 0.774 | 0.261 | 0.163 -> 0.043 | 0.137 | 0.362 | 0.749 |
+| **s2xsc-lidm (soft pass + soft 2c)** | **0.785** | **0.049** | 0.142 -> **0.031** | 0.118 | **0.203** | **0.789** |
+| s2c-laya (same-data Laya) | 0.757 | 0.173 | 0.089 -> 0.060 | 0.153 | 0.322 | 0.773 |
+| Laya-TD (published, soft-trained) | 0.767 | 0.062 | 0.214 | | 0.243 | |
+
+s2xsc vs s2xc +1.1 [−0.4, +2.6] (p = 0.17); vs same-data Laya **+2.8 [+1.1, +4.6]** (p < 0.001). Selective (calibrated):
+most confident half 0.936 (s2xc 0.903, Laya 0.901); confidence >= 0.9 answers 37% at 0.950, >= 0.95 26% at 0.985.
+
+- Soft targets in 2c are the big win: Brier against the benchmark's soft gold 0.261 -> **0.049**, below the published
+  soft-trained Laya-TD (0.062); score MAE 0.362 -> 0.203; the best accuracy and confidence ranking of any model.
+  The raw soft model predicts the spread of the labels, so it is underconfident about being right (fitted temperatures
+  0.41-0.48, sharpening); after the temperature step it is also the best calibrated (ECE 0.031). Use raw outputs as
+  label distributions and calibrated outputs for automation thresholds.
+- **Separated (2026-11-24, `scripts/run_soft2c.sh`): soft 2c directly on s2x-lidm (`s2xcs-lidm`)** reaches accuracy
+  **0.793** (vs hard 2c +1.9 [+0.4, +3.5], p = 0.009; vs same-data Laya +3.7 [+1.9, +5.5], p < 0.001; vs soft pass + soft 2c
+  +0.85 [−0.5, +2.1], n.s.), Brier vs soft gold 0.049, score MAE 0.203, calibrated ECE **0.026**, AUROC 0.792; calibrated
+  confidence >= 0.95 answers 24% at 0.988. The soft stage-2 pass adds nothing and costs reading accuracy, so the recipe
+  is: stage 2 with hard labels, then 2c with soft targets.
+
+**Other tasks** (one more pass vs s2x-lidm):
+
+| Task | s2x | + soft pass | + replay pass |
+|---|---|---|---|
+| VitaminC | 0.708 | 0.697 (−1.1) | 0.708 (±0) |
+| RACE | **0.607** | 0.582 (−2.5) | 0.577 (−3.0) |
+| QuAIL | **0.631** | 0.603 (−2.8) | 0.596 (−3.5) |
+| Banking77, 77 names | **0.625** | 0.600 (−2.5) | 0.624 (−0.1) |
+| Banking77, descriptions | **0.627** | 0.616 (−1.1) | 0.618 (−0.9) |
+| 13-40 options | 0.286 | 0.323 (+3.7) | **0.364 (+7.8)** |
+| 40 held-out label sets | 0.594 | 0.596 (+0.2) | **0.609 (+1.5)** |
+| SQuAD 2.0 | 0.704 | 0.709 (+0.5) | **0.739 (+3.5)** |
+| PubMedQA | **0.622** | 0.569 (−5.3) | 0.609 (−1.3) |
+| CondaQA | **0.566** | 0.451 (−11.5) | 0.505 (−6.1) |
+| ANLI | 0.412 | **0.446 (+3.4)** | 0.404 (−0.8) |
+| When2Call | **0.380** | 0.350 (−3.0) | 0.371 (−0.9) |
+| BoolQ | **0.802** | 0.794 | 0.793 |
+
+- Replay helps label variety (13-40 options +7.8, held-out label sets +1.5) and SQuAD 2.0 (+3.5), but not Banking77,
+  and costs reading (RACE −3, QuAIL −3.5) and CondaQA (−6.1; the replay is 62% NLI, which carries abstain options).
+- Both second passes lose 2.5-3.5 on RACE / QuAIL, so the extra pass itself (not its ingredient) may be the cause; a
+  hard second pass without replay is the missing control. CondaQA moves with the wording-dependent abstain bias
+  (see "Abstain options with descriptions") and should be read with that test, not alone.
+
+---
+
+## Stage 3 on LIDM-X: soft labels from human votes, temperatures, abstain by confidence (2026-11-24)
+
+`scripts/run_stage3.sh`. **3a** (`s3a-lidm`): from `s2x-lidm`, one pass at lr 1e-5 with `--soft-targets` over
+`data/stage3/train.jsonl` (`scripts/prepare_stage3.py`; GoEmotions raw ratings 75,000 noul questions from 25,000
+comments, P(emotion) = rater share, Apache-2.0; DICES 1,072 conversations x2, P(unsafe) = (Yes + Unsure / 2) / raters,
+CC BY 4.0; 25% replay of the soft stage-2 mix; 102,859 questions, 1 h 09 min). **3b**: `scripts/fit_temperatures.py`,
+one temperature per question type x option-count bucket, fitted on 6,000 held-out calibration questions (Open-Jev
+calibration split, tasksource-jev validation, stage-2 dev; `data/calibration/calib.jsonl`). "-t" = with temperatures.
+
+**Match to human vote distributions** (`scripts/eval_soft_labels.py`; held-out GoEmotions 3,000 / DICES 268; ChaosNLI
+3,113, never trained on):
+
+| Set | Metric | s2x | s2x-t | **s3a** | s3a-t | Laya |
+|---|---|---|---|---|---|---|
+| GoEmotions | Brier / JSD / corr(P, share) | 0.231 / 0.095 / 0.62 | 0.219 / 0.096 / 0.62 | **0.070 / 0.034 / 0.82** | 0.070 / 0.035 / 0.82 | 0.178 / 0.067 / 0.66 |
+| DICES | Brier / JSD / corr | 0.152 / 0.059 / 0.43 | 0.121 / 0.043 / 0.45 | 0.061 / 0.018 / 0.55 | **0.057 / 0.017 / 0.55** | 0.143 / 0.050 / 0.45 |
+| ChaosNLI | Brier / JSD / acc vs majority | 0.167 / 0.068 / 0.647 | **0.162 / 0.066 / 0.647** | 0.201 / 0.081 / 0.640 | 0.174 / 0.072 / 0.640 | 0.176 / 0.072 / 0.582 |
+
+**Typed decisions (unseen schemas) and the context suite:** accuracy unchanged by 3a (0.5485 vs 0.5495; context tasks within
+±2, CondaQA +2.3, SQuAD 2.0 +1.8, RACE −1.4). Typed-decisions ECE: s2x 0.103 -> s2x-t 0.078; s3a **0.046** -> s3a-t
+0.052; Brier vs soft gold 0.217 / 0.201 / 0.177 / 0.169. Mean ECE over the 11 context tasks: s2x 0.097, s2x-t 0.087,
+s3a 0.102, s3a-t 0.091, Laya 0.098.
+
+**Abstain by confidence** (`scripts/eval_abstain_confidence.py`; real answers only, abstain below a threshold fitted on each
+task's dev split; same 1,000 test questions as "Abstain options with descriptions"):
+
+| Task (gold abstains) | s2x: options / by confidence | s3a | Laya |
+|---|---|---|---|
+| CondaQA (6.4%) | 0.557 / **0.626** | 0.586 / 0.602 | 0.500 / 0.566 |
+| ANLI (32.0%) | 0.390 / **0.415** | 0.390 / 0.404 | 0.404 / 0.412 |
+| VitaminC (12.8%) | 0.691 / 0.689 | 0.706 / 0.704 | **0.787** / 0.770 |
+
+The fitted thresholds land at ~0.50: the best rule is to (almost) never abstain (0-1.5% abstentions for LIDM-X, up to
+6.7% for Laya). So dropping the abstain option and always answering beats the option on CondaQA (+6.9) and ANLI (+2.5)
+for LIDM-X, but confidence does not single out the questions whose answer is "don't know" / "neutral".
+
+- **3a** teaches the trained vote distributions very well (GoEmotions Brier 0.231 -> 0.070, DICES 0.152 -> 0.061, both
+  better than Laya) and halves typed-decisions ECE (0.103 -> 0.046) at no accuracy cost, but does not transfer to NLI
+  disagreement (ChaosNLI slightly worse). Keep it; NLI-type vote data that is commercial-clean is the missing piece.
+- **3b** with general-purpose temperatures gives a modest ~10% ECE gain; temperatures fitted on the target task's own
+  held-out cases do much more (typed decisions after 2c: 0.163 -> 0.026). Ship the general temperatures as the default
+  and recalibrate per deployment on a few hundred labelled cases.
+- **Abstaining** is best handled outside the options: answer from the real options and route low-confidence cases on.
+
+---
+
 ## Appendix: preliminary run (superseded by the table above; label ids with underscores, `predict_batch`; test, 3080 examples, 77 options, zero-shot, one `choice` question)
 
 Hardware: RTX 4070 SUPER, bf16, SDPA. Laya 0.4.20, checkpoint `convaiinnovations/laya` (as shipped, shipped temperatures applied).

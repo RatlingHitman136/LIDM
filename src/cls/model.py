@@ -337,12 +337,17 @@ class LIDM(nn.Module):
         return logits.masked_fill(~opt_mask, float("-inf"))
 
 
-def decision_loss(logits, gold, opt_mask, is_score, rps_weight: float = 0.5):
-    """Cross-entropy per question (= KL to a one-hot target) + rps_weight x RPS for score questions."""
+def decision_loss(logits, gold, opt_mask, is_score, rps_weight: float = 0.5, target=None):
+    """Cross-entropy per question (= KL to the target up to a constant) + rps_weight x RPS for score questions.
+    target: optional Q x N distributions (soft labels, zero on padded options); default one-hot at gold."""
     logp = logits.log_softmax(-1)
-    ce = -logp.gather(1, gold[:, None]).squeeze(1)
+    if target is None:
+        ce = -logp.gather(1, gold[:, None]).squeeze(1)
+        cum_t = (torch.arange(logits.shape[1], device=logits.device)[None] >= gold[:, None]).float()
+    else:
+        ce = -(target * logp.masked_fill(~opt_mask, 0.0)).sum(-1)  # padded options: -inf logits, 0 target
+        cum_t = target.cumsum(-1)
     cum_p = logp.exp().cumsum(-1)
-    cum_t = (torch.arange(logits.shape[1], device=logits.device)[None] >= gold[:, None]).float()
     k = opt_mask.sum(-1).clamp(min=2)
     rps = ((cum_p - cum_t) ** 2 * opt_mask).sum(-1) / (k - 1)
     return (ce + rps_weight * rps * is_score.float()).mean()

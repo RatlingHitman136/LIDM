@@ -43,6 +43,7 @@ ap.add_argument("--n", type=int, default=1000, help="questions per task (typed-d
 ap.add_argument("--tasks", nargs="+", help="subset of " + " ".join(cs.TASKS))
 ap.add_argument("--items", nargs="+", help="evaluate these item files instead (task = file stem), with accuracy by option "
                 "count and option length, to artifacts/label_suite/")
+ap.add_argument("--temps", help="stage-3b temperatures.json to apply (cls.calibration) to every prediction")
 ap.add_argument("--report", action="store_true")
 ap.add_argument("--report-labels", action="store_true")
 ap.add_argument("--no-track", action="store_true")
@@ -143,6 +144,11 @@ else:
 
     params = {"checkpoint": ckpt}
 
+if a.temps:
+    from cls import calibration
+
+    _temps, _raw = calibration.load(a.temps), predict
+    predict = lambda item: calibration.apply(_raw(item), item["type"], _temps)
 if a.items:
     from cls.train import read_jsonl
 

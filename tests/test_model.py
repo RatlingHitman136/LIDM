@@ -171,3 +171,25 @@ def test_looped_head_checkpointing_is_exact():
         grads.append([p.grad.clone() for p in h.parameters() if p.grad is not None])
     assert torch.allclose(outs[0], outs[1], atol=1e-6)
     assert len(grads[0]) == len(grads[1]) and all(torch.allclose(a, b, atol=1e-6) for a, b in zip(*grads))
+
+
+def test_soft_target_loss():
+    """One-hot targets reproduce the hard loss exactly; soft targets stay finite with padded (-inf) options."""
+    import torch
+
+    from cls.model import decision_loss
+    from cls.train import soft_target
+
+    torch.manual_seed(0)
+    logits = torch.randn(3, 4)
+    mask = torch.tensor([[1, 1, 1, 0], [1, 1, 1, 1], [1, 1, 0, 0]], dtype=torch.bool)
+    logits = logits.masked_fill(~mask, float("-inf"))
+    gold, is_score = torch.tensor([2, 0, 1]), torch.tensor([True, False, True])
+    items = [{"gold": 2}, {"gold": 0, "soft": [0.0, 0.0, 0.0, 0.0]}, {"gold": 1}]  # all-zero soft -> one-hot
+    hard = decision_loss(logits, gold, mask, is_score)
+    assert torch.allclose(decision_loss(logits, gold, mask, is_score, target=soft_target(items, 4, "cpu")), hard)
+    items[0]["soft"], items[2]["soft"] = [0.2, 0.3, 0.5], [3.0, 1.0]  # normalised: [0.75, 0.25]
+    tgt = soft_target(items, 4, "cpu")
+    assert torch.allclose(tgt[2], torch.tensor([0.75, 0.25, 0.0, 0.0]))
+    soft = decision_loss(logits, gold, mask, is_score, target=tgt)
+    assert torch.isfinite(soft) and not torch.allclose(soft, hard)
